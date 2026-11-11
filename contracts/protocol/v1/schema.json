@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://beamfall.dev/relay/protocol/v1/schema.json",
+  "title": "Beamfall Relay Carrier Handshake Frame (v1)",
+  "description": "Wire schema for the relay carrier handshake protocol (ADR-0018, ADR-0122). Length-prefixed JSON: 4-byte big-endian uint32 length followed by this JSON object. Max frame size 65536 bytes. Both the relay server (AGPL) and core carrier client (proprietary) must conform to this schema.",
+  "type": "object",
+  "required": ["type"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["hello", "ack", "error"],
+      "description": "Frame discriminator. Exactly one of: 'hello' (client→server registration), 'ack' (server→client acceptance), 'error' (either direction, connection terminates after)."
+    },
+    "hello": {
+      "$ref": "#/definitions/Hello",
+      "description": "Present when type='hello'. Absent (omitempty) otherwise."
+    },
+    "ack": {
+      "$ref": "#/definitions/Ack",
+      "description": "Present when type='ack'. Absent (omitempty) otherwise."
+    },
+    "error": {
+      "type": "string",
+      "description": "Non-empty when type='error'. Absent (omitempty) otherwise. Human-readable reason string; known values: 'invalid hello', 'unauthorized'."
+    }
+  },
+  "definitions": {
+    "Hello": {
+      "type": "object",
+      "required": ["version", "token", "hostnames"],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 1,
+          "description": "Protocol version. Both sides must agree; mismatch causes an error frame."
+        },
+        "token": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "Opaque carrier authentication token. Encoded as base64 string in JSON (Go []byte marshals as base64). Must not be logged."
+        },
+        "hostnames": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Hostnames this carrier serves. Each must be a valid DNS label sequence."
+        }
+      },
+      "additionalProperties": false
+    },
+    "Ack": {
+      "type": "object",
+      "required": ["version", "carrier_id", "hostnames"],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "description": "Informational protocol version echoed from the accepted hello. Carriers do not enforce this value after the hello is accepted."
+        },
+        "carrier_id": {
+          "type": "string",
+          "description": "Server-assigned carrier identifier for this registration."
+        },
+        "hostnames": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Hostnames the relay registered for this carrier (may differ from requested list)."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

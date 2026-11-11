@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "boundaries": [
+    {
+      "boundary": "relay-core-tunnel",
+      "owner": "beamfall-relay",
+      "producer": "beamfall-relay",
+      "artifact": "contracts/protocol/v1/schema.json + contracts/protocol/v1/vectors.json",
+      "version": "1",
+      "activeArtifactVersion": "1",
+      "consumers": ["beamfall", "beamfall-relay"],
+      "conformanceTest": "internal/protocol/conformance_test.go",
+      "knownDrift": []
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+schema: spec-driven
+
+context: |
+  Work items live in the Corvint Tasks store attached to beamfall/core (queue:core:main, prefix
+  CORE). Name the ticket ID in every proposal. tasks.md is a checklist for one change, never a
+  work queue.
+  A cross-repo contract is specified once, in the repository that owns it; link to the owner's
+  spec or ADR instead of restating it.
+  Existing ADRs and docs/ pages stay canonical. openspec/specs/ covers only capabilities that a
+  change has touched since adoption; do not backfill untouched behaviour.
+  The workflow itself is specified in beamfall/core: openspec/changes/adopt-openspec/.
+
+rules:
+  proposal:
+    - Name the Tasks ticket ID.
+    - State non-goals, failure modes, acceptance evidence and rollback.
+  tasks:
+    - End with this repository's gate and the archive step.

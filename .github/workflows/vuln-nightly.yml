@@ -1,0 +1,67 @@
+# Nightly dependency scan (REVSWEEP-DEPCI-1). One job:
+#
+#   govulncheck — scans the full Go module graph for known CVEs via the Go
+#   vulnerability database. Fails if any vulnerability is found that affects
+#   reachable symbols. Always expected to be clean; any failure is actionable.
+#
+#   license-tripwire — runs go-licenses to list dependency licenses and fails
+#   if any dependency carries a copyleft license incompatible with relay
+#   being reused in Beamfall's proprietary cloud (AGPL/GPL/LGPL/SSPL). Relay
+#   itself is AGPL v3; Beamfall holds the copyright under the CLA.
+#
+# Intentionally outside make gate — a full scan adds latency per merge and is
+# most useful as a daily alert rather than a hard push gate. Any new finding
+# becomes a roadmap ticket before the next release gate.
+name: vuln-nightly
+
+on:
+  schedule:
+    - cron: "23 4 * * *" # Daily 04:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout relay
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: beamfall-relay
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: beamfall-relay/go.mod
+          cache: true
+          cache-dependency-path: beamfall-relay/go.sum
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
+      - name: govulncheck ./...
+        working-directory: beamfall-relay
+        run: govulncheck ./...
+
+  license-tripwire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout relay
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: beamfall-relay
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: beamfall-relay/go.mod
+          cache: true
+          cache-dependency-path: beamfall-relay/go.sum
+      - name: install go-licenses
+        run: go install github.com/google/go-licenses@v1.6.0
+      - name: check for copyleft-incompatible licenses
+        working-directory: beamfall-relay
+        run: |
+          go-licenses check ./... \
+            --disallowed_types=forbidden,restricted,reciprocal \
+            --ignore github.com/beamfall/relay/relaytoken

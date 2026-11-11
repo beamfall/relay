@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "generated_by": "cmd/gen-vectors (go run ./cmd/gen-vectors)",
+  "carriers": [
+    "tcp",
+    "quic"
+  ],
+  "vectors": [
+    {
+      "name": "hello_basic",
+      "description": "Minimal hello frame: version=1, single hostname, short token.",
+      "struct": {
+        "type": "hello",
+        "hello": {
+          "version": 1,
+          "token": "b3BhcXVlLXRva2VuLWFiYw==",
+          "hostnames": [
+            "home.relay.example"
+          ]
+        }
+      },
+      "wire_bytes_hex": "0000006c7b2274797065223a2268656c6c6f222c2268656c6c6f223a7b2276657273696f6e223a312c22746f6b656e223a22623342686358566c4c585276613256754c57466959773d3d222c22686f73746e616d6573223a5b22686f6d652e72656c61792e6578616d706c65225d7d7d"
+    },
+    {
+      "name": "hello_multi_hostname",
+      "description": "Hello frame with multiple hostnames.",
+      "struct": {
+        "type": "hello",
+        "hello": {
+          "version": 1,
+          "token": "dG9r",
+          "hostnames": [
+            "a.example.com",
+            "b.example.com",
+            "c.example.com"
+          ]
+        }
+      },
+      "wire_bytes_hex": "000000737b2274797065223a2268656c6c6f222c2268656c6c6f223a7b2276657273696f6e223a312c22746f6b656e223a2264473972222c22686f73746e616d6573223a5b22612e6578616d706c652e636f6d222c22622e6578616d706c652e636f6d222c22632e6578616d706c652e636f6d225d7d7d"
+    },
+    {
+      "name": "ack_basic",
+      "description": "Basic ack frame returned by server on acceptance.",
+      "struct": {
+        "type": "ack",
+        "ack": {
+          "version": 1,
+          "carrier_id": "carrier-uuid-0001",
+          "hostnames": [
+            "home.relay.example"
+          ]
+        }
+      },
+      "wire_bytes_hex": "000000667b2274797065223a2261636b222c2261636b223a7b2276657273696f6e223a312c22636172726965725f6964223a22636172726965722d757569642d30303031222c22686f73746e616d6573223a5b22686f6d652e72656c61792e6578616d706c65225d7d7d"
+    },
+    {
+      "name": "error_invalid_hello",
+      "description": "Error frame sent by server for malformed or version-mismatch hello.",
+      "struct": {
+        "type": "error",
+        "error": "invalid hello"
+      },
+      "wire_bytes_hex": "000000287b2274797065223a226572726f72222c226572726f72223a22696e76616c69642068656c6c6f227d"
+    },
+    {
+      "name": "error_unauthorized",
+      "description": "Error frame sent by server when token verification fails.",
+      "struct": {
+        "type": "error",
+        "error": "unauthorized"
+      },
+      "wire_bytes_hex": "000000277b2274797065223a226572726f72222c226572726f72223a22756e617574686f72697a6564227d"
+    },
+    {
+      "name": "cache_push",
+      "description": "Cache-carrier push frame announcing one segment payload.",
+      "struct": {
+        "type": "cache_push",
+        "cache_push": {
+          "segment_set_id": "segset_abc",
+          "segment": "0001.m4s",
+          "content_type": "video/mp4",
+          "expires_at": "2026-07-07T12:00:00Z",
+          "bytes": 10
+        }
+      },
+      "wire_bytes_hex": "000000a17b2274797065223a2263616368655f70757368222c2263616368655f70757368223a7b227365676d656e745f7365745f6964223a227365677365745f616263222c227365676d656e74223a22303030312e6d3473222c22636f6e74656e745f74797065223a22766964656f2f6d7034222c22657870697265735f6174223a22323032362d30372d30375431323a30303a30305a222c226279746573223a31307d7d"
+    },
+    {
+      "name": "cache_ack_quota_exceeded",
+      "description": "Cache-carrier typed quota rejection with quota state.",
+      "struct": {
+        "type": "cache_ack",
+        "cache_ack": {
+          "status": "rejected",
+          "error": "quota_exceeded",
+          "quota": {
+            "used_bytes": 64,
+            "cap_bytes": 64
+          }
+        }
+      },
+      "wire_bytes_hex": "000000787b2274797065223a2263616368655f61636b222c2263616368655f61636b223a7b22737461747573223a2272656a6563746564222c226572726f72223a2271756f74615f6578636565646564222c2271756f7461223a7b22757365645f6279746573223a36342c226361705f6279746573223a36347d7d7d"
+    },
+    {
+      "name": "cache_inventory_request",
+      "description": "Home-server inventory reconciliation request for one segment set.",
+      "struct": {
+        "type": "cache_inventory_request",
+        "cache_inventory_request": {
+          "segment_set_id": "segset_abc"
+        }
+      },
+      "wire_bytes_hex": "0000005c7b2274797065223a2263616368655f696e76656e746f72795f72657175657374222c2263616368655f696e76656e746f72795f72657175657374223a7b227365676d656e745f7365745f6964223a227365677365745f616263227d7d"
+    },
+    {
+      "name": "cache_inventory",
+      "description": "Relay inventory response listing currently-held unexpired segments.",
+      "struct": {
+        "type": "cache_inventory",
+        "cache_inventory": {
+          "entries": [
+            {
+              "segment": "0001.m4s",
+              "bytes": 10,
+              "content_type": "video/mp4",
+              "expires_at": "2026-07-07T12:00:00Z"
+            }
+          ],
+          "quota": {
+            "used_bytes": 10,
+            "cap_bytes": 1024
+          }
+        }
+      },
+      "wire_bytes_hex": "000000c67b2274797065223a2263616368655f696e76656e746f7279222c2263616368655f696e76656e746f7279223a7b22656e7472696573223a5b7b227365676d656e74223a22303030312e6d3473222c226279746573223a31302c22636f6e74656e745f74797065223a22766964656f2f6d7034222c22657870697265735f6174223a22323032362d30372d30375431323a30303a30305a227d5d2c2271756f7461223a7b22757365645f6279746573223a31302c226361705f6279746573223a313032347d7d7d"
+    }
+  ]
+}

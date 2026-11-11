@@ -1,0 +1,98 @@
+name: soak-scheduled
+
+# Scheduled loadgen soak: catches throughput regressions and memory leaks.
+# Thresholds (conservative CI baselines — raise if sustained soak results warrant):
+#   throughput_mbps  >= 20   (target 32; allows ~37% CI headroom)
+#   streams_opened   >= 6    (of 8 requested)
+#   max_rss_bytes    <= 200 MB
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 04:00 UTC daily, after fuzz-nightly (03:00)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: Relay soak / loadgen
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout relay
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: beamfall-relay
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: beamfall-relay/go.mod
+
+      - name: Build relay-loadgen
+        working-directory: beamfall-relay
+        run: go build -o relay-loadgen ./cmd/relay-loadgen
+
+      - name: Run loadgen soak
+        # -duration 45s  — enough signal without dominating CI time
+        # -streams 8     — same concurrency as the manual soak default
+        # -mbps 32       — target throughput matching loadgen default
+        working-directory: beamfall-relay
+        run: |
+          ./relay-loadgen \
+            -duration 45s \
+            -streams 8 \
+            -mbps 32 \
+            | tee soak-results.txt
+
+      - name: Check thresholds
+        shell: bash
+        working-directory: beamfall-relay
+        run: |
+          # Parse key=value output from relay-loadgen
+          parse() { grep "^${1}=" soak-results.txt | cut -d= -f2; }
+
+          THROUGHPUT=$(parse throughput_mbps)
+          STREAMS=$(parse streams_opened)
+          RSS=$(parse relayd_in_process_max_rss_bytes)
+
+          echo "throughput_mbps=${THROUGHPUT}"
+          echo "streams_opened=${STREAMS}"
+          echo "relayd_in_process_max_rss_bytes=${RSS}"
+
+          FAIL=0
+
+          # Threshold: throughput >= 20 Mbps
+          if awk "BEGIN { exit (${THROUGHPUT} >= 20) ? 0 : 1 }"; then
+            echo "PASS throughput ${THROUGHPUT} >= 20 Mbps"
+          else
+            echo "FAIL throughput ${THROUGHPUT} < 20 Mbps"
+            FAIL=1
+          fi
+
+          # Threshold: streams_opened >= 6
+          if [ "${STREAMS}" -ge 6 ]; then
+            echo "PASS streams_opened ${STREAMS} >= 6"
+          else
+            echo "FAIL streams_opened ${STREAMS} < 6"
+            FAIL=1
+          fi
+
+          # Threshold: max RSS <= 200 MB  (200 * 1024 * 1024 = 209715200)
+          if [ "${RSS}" -le 209715200 ]; then
+            echo "PASS max_rss_bytes ${RSS} <= 200 MB"
+          else
+            echo "FAIL max_rss_bytes ${RSS} > 200 MB (leak?)"
+            FAIL=1
+          fi
+
+          exit "${FAIL}"
+
+      - name: Upload soak results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: soak-results-${{ github.run_id }}
+          path: beamfall-relay/soak-results.txt
+          retention-days: 30

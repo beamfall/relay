@@ -1,0 +1,118 @@
+# Release supply-chain pipeline (ORG-19 / DEC-7).
+#
+# The internet-facing relay must not ship UNSIGNED. On a version tag this
+# builds + pushes the relay OCI image to ghcr.io WITH an SBOM + SLSA
+# provenance attestation, then signs the pushed digest with cosign in
+# KEYLESS mode (GitHub OIDC — no long-lived signing key to custody). This
+# mirrors core's image-signing job in `beamfall/.github/workflows/release.yml`
+# (build → push-by-digest → SBOM/provenance attest → cosign keyless sign).
+#
+# Relay has no docker-bake.hcl, so the SBOM + provenance attestations are
+# emitted via buildx's native `--sbom`/`--provenance` outputs instead of
+# bake's declared attestations; the signing model is identical.
+#
+# A separate post-publish `verify` job re-pulls the image BY DIGEST,
+# `cosign verify`s the keyless signature against this repo's GitHub OIDC
+# identity, and smoke-runs the entrypoint to confirm the published artifact
+# is the one that was signed and that it actually runs.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  IMAGE: ghcr.io/beamfall/relay
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+      id-token: write # cosign keyless (OIDC) signing
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout relay
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      # Build + push the multi-arch image WITH the SBOM + SLSA provenance
+      # attestations attached to the pushed manifest. The pushed digest is
+      # captured for signing (the trust anchor carriers verify before pulling
+      # a new relay image). The context is this Relay checkout; relaytoken is
+      # resolved from its commit-local nested module.
+      - name: build + push (attested)
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+          provenance: mode=max
+          sbom: true
+
+      # cosign-sign the image by digest (keyless / OIDC). No key material is
+      # stored anywhere — the signature is bound to this repo's GitHub OIDC
+      # identity via Fulcio + Rekor.
+      - name: cosign sign image (keyless)
+        run: |
+          digest="${{ steps.build.outputs.digest }}"
+          if [ -z "${digest}" ] || [ "${digest}" = "null" ]; then
+            echo "could not resolve pushed image digest from build metadata" >&2
+            exit 1
+          fi
+          cosign sign --yes "${IMAGE}@${digest}"
+
+  # Post-publish verification: prove the published image is signed, pullable,
+  # and runnable BEFORE anything downstream trusts the tag.
+  verify:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      # Verify the keyless signature against THIS repo's OIDC identity. The
+      # identity regexp pins the signer to a tag-push workflow in this repo, so
+      # a signature minted by any other workflow/repo is rejected.
+      - name: cosign verify (keyless, by digest)
+        run: |
+          digest="${{ needs.image.outputs.digest }}"
+          if [ -z "${digest}" ] || [ "${digest}" = "null" ]; then
+            echo "no digest passed from image job" >&2
+            exit 1
+          fi
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${IMAGE}@${digest}"
+
+      # Smoke: pull by digest and run the entrypoint. relayd has no --version
+      # subcommand; --help exits 0 after printing usage (Go flag.Parse), which
+      # proves the signed binary is present and executes without launching the
+      # long-running listeners.
+      - name: smoke-run published image (by digest)
+        run: |
+          digest="${{ needs.image.outputs.digest }}"
+          docker run --rm "${IMAGE}@${digest}" --help

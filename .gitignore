@@ -1,0 +1,31 @@
+/relayd
+/tunnel-client
+*.test
+coverage.out
+gate-result.txt
+.cache/
+/artifacts/
+
+# agent fanout scratch (roadmap-runner) — never commit per-ticket evidence
+RESULT.md
+.agent-evidence/
+
+# compose secret material — operators write carrier cert/key + token here
+# (docs/operator-self-hosted-relay.md), never commit it
+packaging/compose/secrets/
+secrets/
+
+# Claude Code session scratch (agent worktrees, sibling-repo seed symlinks)
+.claude/
+
+# Agent memory lives in ../agent-memory/<repo>/, not in product repos.
+docs/agent-memory/
+
+# Generated OpenSpec agent commands (openspec update)
+.agents/skills/openspec-*/
+
+# Corvint local state
+.context-corvint/
+.corvint/self-observations.jsonl
+.corvint/unplanned-reads.jsonl
+.corvint/unplanned-reads.enabled

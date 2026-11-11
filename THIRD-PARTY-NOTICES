@@ -1,0 +1,71 @@
+THIRD-PARTY NOTICES
+===================
+
+This product includes third-party open-source software. Each component below is
+distributed under its own license, which governs that component independently of
+the AGPL v3 LICENSE for this repository.
+
+-------------------------------------------------------------------------------
+
+github.com/hashicorp/yamux
+  License: Mozilla Public License 2.0 (MPL-2.0)
+  Source:  https://github.com/hashicorp/yamux
+
+  yamux is licensed under the Mozilla Public License, Version 2.0. A copy of the
+  MPL-2.0 is available at https://www.mozilla.org/en-US/MPL/2.0/ and in the
+  yamux source tree (the LICENSE file at github.com/hashicorp/yamux). The
+  complete corresponding source code for yamux is publicly available under the
+  MPL-2.0 at the source URL above.
+
+-------------------------------------------------------------------------------
+
+github.com/alicebob/miniredis/v2
+  License: MIT
+  Source:  https://github.com/alicebob/miniredis
+
+  miniredis is licensed under the MIT License. A copy of the license is in the
+  miniredis source tree (the LICENSE file at github.com/alicebob/miniredis).
+
+-------------------------------------------------------------------------------
+
+github.com/prometheus/client_golang
+  License: Apache License 2.0 (Apache-2.0)
+  Source:  https://github.com/prometheus/client_golang
+
+  client_golang is licensed under the Apache License, Version 2.0. A copy of
+  the Apache-2.0 license is available at
+  https://www.apache.org/licenses/LICENSE-2.0 and in the client_golang source
+  tree (the LICENSE file at github.com/prometheus/client_golang).
+
+-------------------------------------------------------------------------------
+
+github.com/quic-go/quic-go
+  License: MIT
+  Source:  https://github.com/quic-go/quic-go
+
+  quic-go is licensed under the MIT License. A copy of the license is in the
+  quic-go source tree (the LICENSE file at github.com/quic-go/quic-go).
+
+-------------------------------------------------------------------------------
+
+github.com/redis/go-redis/v9
+  License: BSD 2-Clause "Simplified" License (BSD-2-Clause)
+  Source:  https://github.com/redis/go-redis
+
+  go-redis is licensed under the BSD 2-Clause License. A copy of the license
+  is in the go-redis source tree (the LICENSE file at
+  github.com/redis/go-redis).
+
+-------------------------------------------------------------------------------
+
+go.opentelemetry.io/otel
+go.opentelemetry.io/otel/sdk
+go.opentelemetry.io/otel/trace
+  License: Apache License 2.0 (Apache-2.0)
+  Source:  https://github.com/open-telemetry/opentelemetry-go
+
+  otel, otel/sdk, and otel/trace are three modules from the same
+  opentelemetry-go repository, each licensed under the Apache License,
+  Version 2.0. A copy of the Apache-2.0 license is available at
+  https://www.apache.org/licenses/LICENSE-2.0 and in the opentelemetry-go
+  source tree (the LICENSE file at github.com/open-telemetry/opentelemetry-go).

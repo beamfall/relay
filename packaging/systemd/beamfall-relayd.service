@@ -1,0 +1,64 @@
+[Unit]
+Description=Beamfall Self-hosted Relay
+Documentation=https://github.com/beamfall/relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=beamfall-relay
+Group=beamfall-relay
+EnvironmentFile=/etc/beamfall-relay/relayd.env
+# Creates /var/lib/beamfall-relay owned by User/Group and keeps that state path
+# writable under ProtectSystem=strict for the HMAC replay nonce store and
+# Redis fair-use final-delta outbox.
+StateDirectory=beamfall-relay
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/relayd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+# Bounds this unit's resident memory. relayd's steady-state usage is dominated by per-connection
+# splice buffers (32 KiB per direction; see internal/relay/relay.go) plus goroutine/TLS overhead:
+# the default --max-public-conns (1024) alone bounds splice buffers to roughly 64 MiB, so 512M
+# is a conservative starting ceiling with headroom for the fair-use in-memory accounting and HMAC
+# replay-nonce maps. Raise it if you raise --max-public-conns/--stream-cap well above their
+# defaults, and confirm the actual ceiling against `systemctl status beamfall-relayd` (or the
+# cgroup's memory.peak) under your real traffic rather than trusting this default unmeasured.
+MemoryMax=512M
+# Each accepted public or carrier TCP connection holds one file descriptor for the life of the
+# connection (yamux multiplexes a carrier's streams over its single socket, so streams do not add
+# further fds); the listener sockets, HMAC nonce store, and fair-use outbox add a handful more. The
+# default --max-public-conns (1024) plus --max-carrier-conns (64) already approach a typical distro
+# default of 1024 open files, so this raises the ceiling well above the shipped connection caps.
+LimitNOFILE=65536
+# Journald retains this unit's logs indefinitely by default, which contradicts the published
+# operational-log retention window (24h; see docs/relay-threat-model.md "Retention Bounds"). Bound
+# it with a per-unit journald drop-in, e.g. /etc/systemd/journald@beamfall-relayd.conf.d/retention.conf:
+#   [Journal]
+#   MaxRetentionSec=1day
+# or scope it to the whole journal in /etc/systemd/journald.conf.d/beamfall-relay-retention.conf.
+# See docs/operator-self-hosted-relay.md for the full drop-in walkthrough.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+PrivateDevices=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+SystemCallFilter=@system-service
+UMask=0077
+ProtectProc=invisible
+
+[Install]
+WantedBy=multi-user.target

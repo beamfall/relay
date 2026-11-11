@@ -1,0 +1,35 @@
+name: relay-core-e2e-nightly
+
+on:
+  schedule:
+    - cron: '30 4 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  relay-core-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout relay
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: beamfall-relay
+          persist-credentials: false
+
+      - name: Checkout core
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: beamfall/beamfall
+          path: beamfall
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: beamfall-relay/go.mod
+
+      - name: Relay core real-binary E2E
+        working-directory: beamfall-relay
+        run: BEAMFALL_CORE_REPO="$GITHUB_WORKSPACE/beamfall" script/relay-core-e2e.sh

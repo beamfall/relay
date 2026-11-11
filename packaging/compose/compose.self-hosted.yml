@@ -1,0 +1,94 @@
+services:
+  relayd:
+    image: ghcr.io/beamfall/relay@sha256:${BEAMFALL_RELAY_DIGEST:?set the verified 64-hex release digest}
+    container_name: beamfall-relayd
+    restart: unless-stopped
+    # Bounds container-log retention to the published operational-log retention window
+    # (24h; see docs/relay-threat-model.md "Retention Bounds" and docs/operator-self-hosted-relay.md).
+    # Without this, Docker's default json-file driver keeps logs unbounded, contradicting the
+    # threat-model claim. Adjust only if you also update the published retention window.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      # Public clients should reach external TCP/443; relayd listens on :8443 in-container.
+      - "${RELAYD_PUBLIC_PORT:-443}:8443"
+      # Docker's iptables/DNAT integration bypasses host firewalls (ufw, firewalld) for
+      # published ports, so a bare host:port mapping here would expose the carrier port to
+      # all interfaces regardless of host firewall rules — see "Carrier Port Firewalling" in
+      # docs/operator-self-hosted-relay.md. Defaults to loopback-only; set RELAYD_CARRIER_BIND
+      # to a specific host IP to expose it externally, and apply the DOCKER-USER iptables
+      # remedy (or `"iptables": false` in daemon.json plus your own forwarding rules) documented
+      # there before doing so.
+      - "${RELAYD_CARRIER_BIND:-127.0.0.1}:${RELAYD_CARRIER_PORT:-9443}:9443"
+      - "127.0.0.1:${RELAYD_ADMIN_PORT:-9080}:9080"
+    environment:
+      RELAYD_PUBLIC_ADDR: ":8443"
+      RELAYD_CARRIER_ADDR: ":9443"
+      RELAYD_ADMIN_ADDR: "127.0.0.1:9080"
+      RELAYD_CARRIER_CERT: "/run/secrets/relayd_carrier_cert"
+      RELAYD_CARRIER_KEY: "/run/secrets/relayd_carrier_key"
+      RELAYD_TOKEN_FILE: "/run/secrets/relayd_token"
+      RELAYD_TOKEN_MODE: "${RELAYD_TOKEN_MODE:-hmac}"
+      RELAYD_HMAC_NONCE_STORE: "${RELAYD_HMAC_NONCE_STORE:-/var/lib/beamfall-relay/hmac-nonces.json}"
+      RELAYD_HOSTNAMES: "${RELAYD_HOSTNAMES:?set the comma-separated relay hostnames}"
+      RELAYD_FAIR_USE_ENABLED: "${RELAYD_FAIR_USE_ENABLED:-false}"
+      RELAYD_FAIR_USE_WINDOW_DAYS: "${RELAYD_FAIR_USE_WINDOW_DAYS:-30}"
+      RELAYD_FAIR_USE_SOFT_LIMIT_BYTES: "${RELAYD_FAIR_USE_SOFT_LIMIT_BYTES:-0}"
+      RELAYD_FAIR_USE_HARD_LIMIT_BYTES: "${RELAYD_FAIR_USE_HARD_LIMIT_BYTES:-0}"
+      RELAYD_FAIR_USE_THROTTLED_MAX_CONNS: "${RELAYD_FAIR_USE_THROTTLED_MAX_CONNS:-4}"
+      RELAYD_FAIR_USE_STORE: "${RELAYD_FAIR_USE_STORE:-memory}"
+    # Same rationale and starting values as MemoryMax/LimitNOFILE in
+    # packaging/systemd/beamfall-relayd.service: splice buffers and the default connection caps
+    # bound steady-state memory and fd usage well under these ceilings; raise them together with
+    # RELAYD_MAX_PUBLIC_CONNS/--stream-cap and confirm against real traffic rather than this
+    # unmeasured default.
+    mem_limit: 512m
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # relay-healthcheck probes /readyz (needs >=1 acknowledged carrier), not /healthz (process
+    # liveness only) — see "Health and Metrics" and "Readiness vs. Liveness Under Compose" in
+    # docs/operator-self-hosted-relay.md. A freshly started relayd with no carrier connected yet is
+    # correctly unready, so `restart: unless-stopped` alone will NOT restart it on that basis; but an
+    # orchestrator that maps "unhealthy" to a forced restart (this stanza does not, but a Swarm/
+    # Kubernetes equivalent might) can crash-loop a relay that is simply waiting for its first
+    # carrier. Size start_period/retries for your carrier's expected reconnect time before wiring
+    # any such restart-on-unhealthy policy.
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/relay-healthcheck" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Secret file permissions are enforced on the HOST, not here. The per-secret
+    # `uid`/`gid`/`mode` long-syntax keys are a Docker Swarm feature and are silently
+    # ignored by plain `docker compose`, which bind-mounts each source file into the
+    # container with the file's existing host owner and mode. relayd runs as uid 65532
+    # (nonroot distroless), so the host secret files must be readable by that uid — see
+    # "Required Secrets" in docs/operator-self-hosted-relay.md for the `chown 65532`
+    # step. Declaring uid/gid/mode here would only imply an enforcement plain compose
+    # does not provide.
+    secrets:
+      - relayd_carrier_cert
+      - relayd_carrier_key
+      - relayd_token
+    volumes:
+      # Durable replay state for RELAYD_TOKEN_MODE=hmac. The image seeds this
+      # directory as uid 65532/mode 0700, so a new named volume remains writable
+      # by the distroless nonroot process and survives container replacement.
+      - relayd_state:/var/lib/beamfall-relay
+
+volumes:
+  relayd_state:
+
+secrets:
+  relayd_carrier_cert:
+    file: ./secrets/carrier.crt
+  relayd_carrier_key:
+    file: ./secrets/carrier.key
+  relayd_token:
+    file: ./secrets/token

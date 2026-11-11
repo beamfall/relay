@@ -1,0 +1,19 @@
+# golangci-lint configuration for beamfall-relay
+# ADR-0121 §4: baseline lint + coverage enforcement in make gate
+#
+# errcheck is enabled repo-wide; pre-existing best-effort cleanup calls carry
+# narrow per-callsite nolint annotations.
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+
+issues:
+  exclude:
+    # staticcheck QF1006 - lift condition into loop: pre-existing style choice
+    - "QF1006"

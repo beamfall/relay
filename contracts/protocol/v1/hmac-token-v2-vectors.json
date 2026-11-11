@@ -1,0 +1,297 @@
+{
+  "schema_version": 1,
+  "generated_by": "cmd/gen-vectors (go run ./cmd/gen-vectors -set hmac-token-v2)",
+  "spec": "PROTOCOL.md, section \"Carrier token v2\"",
+  "shared_key_utf8": "beamfall-relay-hmac-token-v2-golden-vector-fixture-0123456789",
+  "allowed_hostnames": [
+    "home.relay.example",
+    "media.relay.example"
+  ],
+  "max_ttl_seconds": 300,
+  "vectors": [
+    {
+      "name": "accept_single_host",
+      "description": "Valid token for one allowed hostname, issued 30s before the relay clock with a 120s lifetime.",
+      "mint_hostnames": [
+        "home.relay.example"
+      ],
+      "issued_at_unix": 1789999970,
+      "expires_at_unix": 1790000090,
+      "nonce_hex": "3b33a301742127384478903b134a9faa",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c6500313738393939393937300031373930303030303930003362333361333031373432313237333834343738393033623133346139666161",
+      "mac_hex": "26353527b0dc08244be12d1701dd62aab1883d2601e17431fb1ba14a7c775705",
+      "token_text": "v2.1789999970.1790000090.3b33a301742127384478903b134a9faa.26353527b0dc08244be12d1701dd62aab1883d2601e17431fb1ba14a7c775705",
+      "requested_hostnames": [
+        "home.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "accept",
+      "accepted_hostnames": [
+        "home.relay.example"
+      ]
+    },
+    {
+      "name": "accept_multi_host",
+      "description": "Valid token for two allowed hostnames. The MAC covers the sorted set, so the hello may list them in any order; accepted hostnames keep the hello order.",
+      "mint_hostnames": [
+        "home.relay.example",
+        "media.relay.example"
+      ],
+      "issued_at_unix": 1789999970,
+      "expires_at_unix": 1790000090,
+      "nonce_hex": "d1c96997fcf920bdd4ac83a483a4bbb3",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c650a6d656469612e72656c61792e6578616d706c6500313738393939393937300031373930303030303930006431633936393937666366393230626464346163383361343833613462626233",
+      "mac_hex": "13dc8ea789e8a91094476a82ae7bd900c13a33c0ae5feb465b5b45f0546a477e",
+      "token_text": "v2.1789999970.1790000090.d1c96997fcf920bdd4ac83a483a4bbb3.13dc8ea789e8a91094476a82ae7bd900c13a33c0ae5feb465b5b45f0546a477e",
+      "requested_hostnames": [
+        "media.relay.example",
+        "home.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "accept",
+      "accepted_hostnames": [
+        "media.relay.example",
+        "home.relay.example"
+      ]
+    },
+    {
+      "name": "accept_mixed_case_host",
+      "description": "Mixed-case hostname: both sides lowercase before the MAC, so the MAC input holds the lowercase name.",
+      "mint_hostnames": [
+        "Home.Relay.EXAMPLE"
+      ],
+      "issued_at_unix": 1789999970,
+      "expires_at_unix": 1790000090,
+      "nonce_hex": "d3be9ba533abb016a0cce4cfbb87fc35",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c6500313738393939393937300031373930303030303930006433626539626135333361626230313661306363653463666262383766633335",
+      "mac_hex": "d6ece72c02e9cf48d33453208e36b779c478d9b7a8d14efc5a3a101a9ce08b12",
+      "token_text": "v2.1789999970.1790000090.d3be9ba533abb016a0cce4cfbb87fc35.d6ece72c02e9cf48d33453208e36b779c478d9b7a8d14efc5a3a101a9ce08b12",
+      "requested_hostnames": [
+        "Home.Relay.EXAMPLE"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "accept",
+      "accepted_hostnames": [
+        "home.relay.example"
+      ]
+    },
+    {
+      "name": "accept_trailing_dot_host",
+      "description": "Fully qualified hostname with a trailing dot and surrounding spaces: both sides trim spaces and strip one trailing dot before the MAC.",
+      "mint_hostnames": [
+        " media.relay.example. "
+      ],
+      "issued_at_unix": 1789999970,
+      "expires_at_unix": 1790000090,
+      "nonce_hex": "568d331586822163806b9775a3a8182e",
+      "mac_input_hex": "7632006d656469612e72656c61792e6578616d706c6500313738393939393937300031373930303030303930003536386433333135383638323231363338303662393737356133613831383265",
+      "mac_hex": "9aa6caa854f05c335184e53a996db7bc0a71942090dd8531624de0b9b081a404",
+      "token_text": "v2.1789999970.1790000090.568d331586822163806b9775a3a8182e.9aa6caa854f05c335184e53a996db7bc0a71942090dd8531624de0b9b081a404",
+      "requested_hostnames": [
+        " media.relay.example. "
+      ],
+      "now_unix": 1790000000,
+      "verdict": "accept",
+      "accepted_hostnames": [
+        "media.relay.example"
+      ]
+    },
+    {
+      "name": "accept_ttl_at_cap",
+      "description": "Signed lifetime exactly 300s (expires_at - issued_at == max_ttl_seconds) is accepted.",
+      "mint_hostnames": [
+        "home.relay.example"
+      ],
+      "issued_at_unix": 1789999990,
+      "expires_at_unix": 1790000290,
+      "nonce_hex": "ba847138961e0e5083d63685d42c2fc6",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c6500313738393939393939300031373930303030323930006261383437313338393631653065353038336436333638356434326332666336",
+      "mac_hex": "e01119cd666a458abb3b6842559e18ca3756aa7c37b6b3b7d0902dfcd0d1e490",
+      "token_text": "v2.1789999990.1790000290.ba847138961e0e5083d63685d42c2fc6.e01119cd666a458abb3b6842559e18ca3756aa7c37b6b3b7d0902dfcd0d1e490",
+      "requested_hostnames": [
+        "home.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "accept",
+      "accepted_hostnames": [
+        "home.relay.example"
+      ]
+    },
+    {
+      "name": "accept_issued_at_now",
+      "description": "issued_at equal to the relay clock is accepted.",
+      "mint_hostnames": [
+        "home.relay.example"
+      ],
+      "issued_at_unix": 1790000000,
+      "expires_at_unix": 1790000060,
+      "nonce_hex": "86b3498d3eac5ec6861ebcc8b878d842",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c6500313739303030303030300031373930303030303630003836623334393864336561633565633638363165626363386238373864383432",
+      "mac_hex": "073f7ed7a49ef376e0cba9ed5d4b04a1183c243b2fef997593b7807d7a954ada",
+      "token_text": "v2.1790000000.1790000060.86b3498d3eac5ec6861ebcc8b878d842.073f7ed7a49ef376e0cba9ed5d4b04a1183c243b2fef997593b7807d7a954ada",
+      "requested_hostnames": [
+        "home.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "accept",
+      "accepted_hostnames": [
+        "home.relay.example"
+      ]
+    },
+    {
+      "name": "accept_issued_at_within_leeway",
+      "description": "issued_at 30s after the relay clock is accepted: the relay allows issued_at up to 60s ahead of its clock.",
+      "mint_hostnames": [
+        "home.relay.example"
+      ],
+      "issued_at_unix": 1790000030,
+      "expires_at_unix": 1790000090,
+      "nonce_hex": "343220e55cb3960c86ec66cd606fb784",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c6500313739303030303033300031373930303030303930003334333232306535356362333936306338366563363663643630366662373834",
+      "mac_hex": "be50249d19cbbc77b406207e03a45efe6fb6e97b0229af5970a4a3da9f9df0da",
+      "token_text": "v2.1790000030.1790000090.343220e55cb3960c86ec66cd606fb784.be50249d19cbbc77b406207e03a45efe6fb6e97b0229af5970a4a3da9f9df0da",
+      "requested_hostnames": [
+        "home.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "accept",
+      "accepted_hostnames": [
+        "home.relay.example"
+      ]
+    },
+    {
+      "name": "reject_expired",
+      "description": "Token whose expires_at is 20s before the relay clock.",
+      "mint_hostnames": [
+        "home.relay.example"
+      ],
+      "issued_at_unix": 1789999800,
+      "expires_at_unix": 1789999980,
+      "nonce_hex": "2e3a10276ed56084aef5639d373a32d7",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c6500313738393939393830300031373839393939393830003265336131303237366564353630383461656635363339643337336133326437",
+      "mac_hex": "ba70b9691a58443807726e90c93aa629828225b07a4d4be8ccf0266c72ae30d3",
+      "token_text": "v2.1789999800.1789999980.2e3a10276ed56084aef5639d373a32d7.ba70b9691a58443807726e90c93aa629828225b07a4d4be8ccf0266c72ae30d3",
+      "requested_hostnames": [
+        "home.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "reject",
+      "reason": "expired"
+    },
+    {
+      "name": "reject_expired_at_expiry_instant",
+      "description": "expires_at equal to the relay clock is already expired: validity is issued_at - 60 \u003c= now \u003c expires_at.",
+      "mint_hostnames": [
+        "home.relay.example"
+      ],
+      "issued_at_unix": 1789999940,
+      "expires_at_unix": 1790000000,
+      "nonce_hex": "836e944dd79741f4e1fdf8fe8147ac2e",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c6500313738393939393934300031373930303030303030003833366539343464643739373431663465316664663866653831343761633265",
+      "mac_hex": "b253a232ba9d0a6a916287bcd06cfe5fb108a8862d78f40d75e9d5c4b28d4c33",
+      "token_text": "v2.1789999940.1790000000.836e944dd79741f4e1fdf8fe8147ac2e.b253a232ba9d0a6a916287bcd06cfe5fb108a8862d78f40d75e9d5c4b28d4c33",
+      "requested_hostnames": [
+        "home.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "reject",
+      "reason": "expired"
+    },
+    {
+      "name": "reject_ttl_over_cap",
+      "description": "Signed lifetime 301s exceeds max_ttl_seconds even though the relay clock is inside it.",
+      "mint_hostnames": [
+        "home.relay.example"
+      ],
+      "issued_at_unix": 1789999990,
+      "expires_at_unix": 1790000291,
+      "nonce_hex": "36c93aa542324e8b04df89b7780d8447",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c6500313738393939393939300031373930303030323931003336633933616135343233323465386230346466383962373738306438343437",
+      "mac_hex": "5acba965d20623ec8bcccbd9db105f18f621aac5c8f37996aeae2af8923743a8",
+      "token_text": "v2.1789999990.1790000291.36c93aa542324e8b04df89b7780d8447.5acba965d20623ec8bcccbd9db105f18f621aac5c8f37996aeae2af8923743a8",
+      "requested_hostnames": [
+        "home.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "reject",
+      "reason": "ttl_exceeds_cap"
+    },
+    {
+      "name": "reject_issued_at_in_future",
+      "description": "issued_at 120s after the relay clock is beyond the 60s issued-at leeway.",
+      "mint_hostnames": [
+        "home.relay.example"
+      ],
+      "issued_at_unix": 1790000120,
+      "expires_at_unix": 1790000180,
+      "nonce_hex": "5484c09c159915b4ec3c70342f36bd34",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c6500313739303030303132300031373930303030313830003534383463303963313539393135623465633363373033343266333662643334",
+      "mac_hex": "f0fd8ce7d6c596b0d326226e5111b26d8ea2f1b56b6a12c581084fabe448f9b2",
+      "token_text": "v2.1790000120.1790000180.5484c09c159915b4ec3c70342f36bd34.f0fd8ce7d6c596b0d326226e5111b26d8ea2f1b56b6a12c581084fabe448f9b2",
+      "requested_hostnames": [
+        "home.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "reject",
+      "reason": "issued_in_future"
+    },
+    {
+      "name": "reject_bad_mac",
+      "description": "Otherwise valid claim whose token carries mac_hex with its last hex digit altered.",
+      "mint_hostnames": [
+        "home.relay.example"
+      ],
+      "issued_at_unix": 1789999970,
+      "expires_at_unix": 1790000090,
+      "nonce_hex": "53398f0512771c9b53304706e17d3651",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c6500313738393939393937300031373930303030303930003533333938663035313237373163396235333330343730366531376433363531",
+      "mac_hex": "7f0dab3a878c57562f6f387716098fcab10ac87edced8bd24496274c8067cf75",
+      "token_text": "v2.1789999970.1790000090.53398f0512771c9b53304706e17d3651.7f0dab3a878c57562f6f387716098fcab10ac87edced8bd24496274c8067cf70",
+      "requested_hostnames": [
+        "home.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "reject",
+      "reason": "bad_mac"
+    },
+    {
+      "name": "reject_replayed_nonce",
+      "description": "The accept_single_host token presented a second time to the same nonce store: each nonce is admitted once.",
+      "mint_hostnames": [
+        "home.relay.example"
+      ],
+      "issued_at_unix": 1789999970,
+      "expires_at_unix": 1790000090,
+      "nonce_hex": "3b33a301742127384478903b134a9faa",
+      "mac_input_hex": "763200686f6d652e72656c61792e6578616d706c6500313738393939393937300031373930303030303930003362333361333031373432313237333834343738393033623133346139666161",
+      "mac_hex": "26353527b0dc08244be12d1701dd62aab1883d2601e17431fb1ba14a7c775705",
+      "token_text": "v2.1789999970.1790000090.3b33a301742127384478903b134a9faa.26353527b0dc08244be12d1701dd62aab1883d2601e17431fb1ba14a7c775705",
+      "requested_hostnames": [
+        "home.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "replay_of": "accept_single_host",
+      "verdict": "reject",
+      "reason": "replayed_nonce"
+    },
+    {
+      "name": "reject_host_not_allowed",
+      "description": "Correctly signed token for a hostname outside the relay's allowed set.",
+      "mint_hostnames": [
+        "other.relay.example"
+      ],
+      "issued_at_unix": 1789999970,
+      "expires_at_unix": 1790000090,
+      "nonce_hex": "a13eecfb2d5b39d6b407821cff290e94",
+      "mac_input_hex": "7632006f746865722e72656c61792e6578616d706c6500313738393939393937300031373930303030303930006131336565636662326435623339643662343037383231636666323930653934",
+      "mac_hex": "60fbdc96581b87df1070aedc4bbd6a6abb692e7f7b2b8fe6be615220f209212e",
+      "token_text": "v2.1789999970.1790000090.a13eecfb2d5b39d6b407821cff290e94.60fbdc96581b87df1070aedc4bbd6a6abb692e7f7b2b8fe6be615220f209212e",
+      "requested_hostnames": [
+        "other.relay.example"
+      ],
+      "now_unix": 1790000000,
+      "verdict": "reject",
+      "reason": "host_not_allowed"
+    }
+  ]
+}

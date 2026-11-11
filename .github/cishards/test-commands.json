@@ -1,0 +1,1 @@
+{"profile":"corvint-test-commands/0","go":{"env":{},"flags":["-count=1","-timeout","30m"]},"languages":{"shell":["make","gate"]}}

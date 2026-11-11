@@ -1,0 +1,81 @@
+{
+  "schema_version": 2,
+  "destination": {
+    "module_path": "github.com/beamfall/relay/relaytoken",
+    "root_replace": "./relaytoken"
+  },
+  "source": {
+    "repository": "https://github.com/Beamfall/cloud",
+    "path": "relaytoken",
+    "snapshot_commit": "d3d764bbf26f9a5e9a60725230c53edfce6a024e",
+    "last_change_commit": "eb6ad80bd03d5974d866096f86dac0db6418e857",
+    "tree_git_oid": "b0e02b9e4716bc8aac70f0d805355c97c15206af",
+    "license": "Beamfall proprietary and confidential",
+    "license_path": "LICENSE.md",
+    "license_sha256": "50bd6e58c34021c69f66c874d8686271a82de4a6352a35d1846ef21e491f96f0"
+  },
+  "destination_license": {
+    "path": "LICENSE",
+    "sha256": "87e38c7a2862df454cffd35a408d79e2a5a42f3368c97bd2a1b5801034976cbd",
+    "relicense": {
+      "spdx": "AGPL-3.0-only",
+      "decision": "Owner decision 2026-11-11: the relay is published under AGPL v3, like the server"
+    }
+  },
+  "files": [
+    {
+      "path": "canonical_parity_test.go",
+      "source_sha256": "a03a126c13a51df036c3170b9153a08f2b0eba8b69d41b7c15a87e5024b20e19",
+      "destination_sha256": "a03a126c13a51df036c3170b9153a08f2b0eba8b69d41b7c15a87e5024b20e19",
+      "transformation": "none"
+    },
+    {
+      "path": "fuzz_test.go",
+      "source_sha256": "f52864e3e0d86261b9bcfeb19f6a57e4261350cd5b5dbdc3ebf0851a41089f5c",
+      "destination_sha256": "72019b75d632023972716b08ff75a7ebccede5fe57c5b24b496249daafa0164b",
+      "transformation": "self-import changed from github.com/beamfall/cloud/relaytoken to github.com/beamfall/relay/relaytoken"
+    },
+    {
+      "path": "go.mod",
+      "source_sha256": "da74d485103e6dd040dd05a170f185952f4fd9fa280f1a4b70626d53d4d41d4b",
+      "destination_sha256": "bd23c46adbbce99ec922fa99d7af7adb7e610245b7e8b733cc6d97e011f3bad0",
+      "transformation": "module path changed from github.com/beamfall/cloud/relaytoken to github.com/beamfall/relay/relaytoken; go directive raised from 1.25 to 1.26.10 (Go 1.25 is end-of-life)"
+    },
+    {
+      "path": "relaytoken.go",
+      "source_sha256": "c7dc1e701c43a291c795272d4827264f43bf6862d8724b4880d1e738ab66efdb",
+      "destination_sha256": "925fcf7873e7ec0a40453fbab78687bf1add8c5fcc3dffb8e1901206fdeb04f5",
+      "transformation": "package documentation updated for the private in-tree Relay snapshot; executable source unchanged"
+    },
+    {
+      "path": "roundtrip_test.go",
+      "source_sha256": "936473b6d3d64021dc4ac7ac684426ef48b1dde449c89a15fbeba8dea1fa71b1",
+      "destination_sha256": "bd3988dada09209c2c904b5cc10abc7c409931b63190cee4016352df131fde6c",
+      "transformation": "self-import changed from github.com/beamfall/cloud/relaytoken to github.com/beamfall/relay/relaytoken; package documentation updated for private in-tree copy parity"
+    },
+    {
+      "path": "testdata/fuzz/FuzzDecodeToken/kat-empty",
+      "source_sha256": "caf81e9797b19c76c1fc4dbf537d4d81f389524539f402d13aa01f93a65ac7e9",
+      "destination_sha256": "caf81e9797b19c76c1fc4dbf537d4d81f389524539f402d13aa01f93a65ac7e9",
+      "transformation": "none"
+    },
+    {
+      "path": "testdata/fuzz/FuzzDecodeToken/kat-four-parts",
+      "source_sha256": "ae15bca4051e0071284998d75cd74ef9bfdb5cba355e582925bb403f4f90fbbd",
+      "destination_sha256": "ae15bca4051e0071284998d75cd74ef9bfdb5cba355e582925bb403f4f90fbbd",
+      "transformation": "none"
+    },
+    {
+      "path": "testdata/fuzz/FuzzDecodeToken/kat-random-bytes",
+      "source_sha256": "598e92321672e9087f4b63384c44e31f3f4b00ca1ecf3651d4017c7e80323cda",
+      "destination_sha256": "598e92321672e9087f4b63384c44e31f3f4b00ca1ecf3651d4017c7e80323cda",
+      "transformation": "none"
+    },
+    {
+      "path": "testdata/fuzz/FuzzDecodeToken/kat-two-parts",
+      "source_sha256": "7eded67fc3eb6efa60984cb820d73b3c3b4c3c04339c5c6bc112b6b2ec9adcf6",
+      "destination_sha256": "7eded67fc3eb6efa60984cb820d73b3c3b4c3c04339c5c6bc112b6b2ec9adcf6",
+      "transformation": "none"
+    }
+  ]
+}

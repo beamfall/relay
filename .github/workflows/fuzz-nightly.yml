@@ -1,0 +1,52 @@
+name: fuzz-nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: FuzzReadFrame
+            pkg: ./internal/protocol/
+          - name: FuzzParseClientHelloRecord
+            pkg: ./internal/sni/
+          - name: FuzzHMACVerifyV2
+            pkg: ./internal/relay/
+
+    steps:
+      - name: Checkout relay
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: beamfall-relay
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: beamfall-relay/go.mod
+          cache-dependency-path: beamfall-relay/go.sum
+
+      - name: Fuzz ${{ matrix.target.name }}
+        working-directory: beamfall-relay
+        run: go test -fuzz=${{ matrix.target.name }} -fuzztime=60s ${{ matrix.target.pkg }}
+
+      - name: Upload crash corpus
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-crash-${{ matrix.target.name }}-${{ github.run_id }}
+          path: |
+            beamfall-relay/${{ matrix.target.pkg }}testdata/fuzz/${{ matrix.target.name }}/
+          if-no-files-found: ignore
+          retention-days: 30
