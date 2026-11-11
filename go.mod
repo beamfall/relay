@@ -3,7 +3,7 @@ module github.com/beamfall/relay
 go 1.26.10
 
 require (
-	github.com/alicebob/miniredis/v2 v2.38.0
+	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/beamfall/relay/relaytoken v0.0.0
 	github.com/hashicorp/yamux v0.1.2
 	github.com/prometheus/client_golang v1.23.2
