@@ -334,3 +334,23 @@ func TestSupersededHold_SuccessorLossNearDeadlineKeepsMaxAge(t *testing.T) {
 		t.Fatalf("closed %v after start; deadline was 350ms", elapsed)
 	}
 }
+
+// CORE-1382 review round 2: a successor lost before expiry still leaves the
+// fallback drain capped at expiry+SupersededStreamMaxAge.
+func TestSupersededHold_SuccessorLostBeforeExpiryKeepsMaxAge(t *testing.T) {
+	s := testServer()
+	s.expiredSessionDrain = time.Hour
+	s.supersededMaxAge = 100 * time.Millisecond
+	s.supersededPoll = 10 * time.Millisecond
+	old, cur := supersededPair(t, s)
+	_ = cur.session.Close()
+	start := time.Now()
+	verified := VerifiedCarrier{ID: "srv-1", ExpiresAt: start.Add(50 * time.Millisecond)}
+
+	go s.awaitCarrierEnd(context.Background(), old.session, verified, old)
+
+	waitClosed(t, old.session, time.Second, "drain outlived SupersededStreamMaxAge with no successor at expiry")
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("closed %v after start; deadline was 150ms", elapsed)
+	}
+}

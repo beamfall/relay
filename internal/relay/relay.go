@@ -1170,34 +1170,17 @@ const supersededSuccessorPoll = time.Second
 // streams already on it. While a live successor (hasLiveSuccessor) holds one of
 // its hostnames it waits until expiresAt+supersededMaxAge. That successor holds
 // an unexpired token, so the identity's authority stays bounded by a valid
-// token. Once no live successor remains it waits at most expiredSessionDrain,
-// and never past the same max-age deadline. It returns true when the session
+// token. Once no live successor remains it waits at most expiredSessionDrain.
+// When supersededMaxAge is set, it never waits past that deadline, even if
+// the successor was already gone at expiry. It returns true when the session
 // ended or the server context was cancelled, and false when the caller should
 // close the session: its last stream finished or a bound elapsed.
 func (s *Server) holdSupersededCarrier(ctx context.Context, session protocol.Session, carrier *carrier, expiresAt time.Time) bool {
 	drainFor := s.expiredSessionDrain
-	if s.supersededMaxAge > 0 && s.registry.hasLiveSuccessor(carrier) {
+	if s.supersededMaxAge > 0 {
 		deadline := expiresAt.Add(s.supersededMaxAge)
-		maxAge := time.NewTimer(time.Until(deadline))
-		defer maxAge.Stop()
-		interval := s.supersededPoll
-		if interval <= 0 {
-			interval = supersededSuccessorPoll
-		}
-		poll := time.NewTicker(interval)
-		defer poll.Stop()
-		for s.registry.hasLiveSuccessor(carrier) {
-			select {
-			case <-session.CloseChan():
-				return true
-			case <-ctx.Done():
-				return true
-			case <-carrier.drained:
-				return false
-			case <-maxAge.C:
-				return false
-			case <-poll.C:
-			}
+		if s.registry.hasLiveSuccessor(carrier) && !s.awaitSuccessorLoss(ctx, session, carrier, deadline) {
+			return session.IsClosed() || ctx.Err() != nil
 		}
 		drainFor = min(drainFor, time.Until(deadline))
 	}
@@ -1216,6 +1199,35 @@ func (s *Server) holdSupersededCarrier(ctx context.Context, session protocol.Ses
 	case <-drain.C:
 		return false
 	}
+}
+
+// awaitSuccessorLoss waits while a live successor holds one of carrier's
+// hostnames. It returns true once no live successor remains, and false when
+// the session ended, ctx was cancelled, the last stream finished or the
+// deadline passed.
+func (s *Server) awaitSuccessorLoss(ctx context.Context, session protocol.Session, carrier *carrier, deadline time.Time) bool {
+	maxAge := time.NewTimer(time.Until(deadline))
+	defer maxAge.Stop()
+	interval := s.supersededPoll
+	if interval <= 0 {
+		interval = supersededSuccessorPoll
+	}
+	poll := time.NewTicker(interval)
+	defer poll.Stop()
+	for s.registry.hasLiveSuccessor(carrier) {
+		select {
+		case <-session.CloseChan():
+			return false
+		case <-ctx.Done():
+			return false
+		case <-carrier.drained:
+			return false
+		case <-maxAge.C:
+			return false
+		case <-poll.C:
+		}
+	}
+	return true
 }
 
 func (s *Server) handlePublicConn(ctx context.Context, conn net.Conn) {

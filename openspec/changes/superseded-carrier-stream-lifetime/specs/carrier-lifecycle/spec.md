@@ -23,7 +23,7 @@ unexpired token. A `SupersededStreamMaxAge` of zero SHALL disable this extension
 #### Scenario: Replacement lost just before the maximum age
 
 - **WHEN** the live replacement ends shortly before `SupersededStreamMaxAge` after the superseded
-  carrier's token expiry
+  carrier's token expiry, or had already ended at that expiry
 - **THEN** the relay still closes the superseded carrier by that maximum age
 
 #### Scenario: Superseded carriers do not extend each other
