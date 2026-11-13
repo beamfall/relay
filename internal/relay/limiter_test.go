@@ -303,3 +303,67 @@ func TestCopyWithLimitReservesBeforeWriting(t *testing.T) {
 		t.Fatalf("settled %d chunks, want 2", len(settled))
 	}
 }
+
+// shortWriter accepts at most limit bytes per call and then returns err.
+type shortWriter struct {
+	limit int
+	err   error
+	got   int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	n := min(len(p), w.limit)
+	w.got += n
+	return n, w.err
+}
+
+// CORE-1407: a chunk the destination only partly accepts, or rejects, still
+// releases its whole reservation and records only the bytes actually written.
+func TestCopyWithLimitSettlesShortAndFailedWrites(t *testing.T) {
+	cases := []struct {
+		name    string
+		limit   int
+		err     error
+		wantErr error
+	}{
+		{"partial write with error", 1000, errors.New("peer reset"), nil},
+		{"zero-byte failure", 0, errors.New("peer reset"), nil},
+		{"short write without error", 1000, nil, io.ErrShortWrite},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &countingFairUseStore{}
+			store.healthy.Store(true)
+			limiter := newFairUseLimiter(FairUseConfig{Enabled: true}, nil)
+			limiter.store = store
+			defer limiter.close()
+			c := &carrier{id: "opaque-server", fairUse: limiter, usage: limiter.tunnel("opaque-server")}
+			dst := &shortWriter{limit: tc.limit, err: tc.err}
+
+			n, err := copyWithLimit(context.Background(), dst, bytes.NewReader(bytes.Repeat([]byte{'x'}, int(fairUseCopyChunkMax))), nil,
+				c.reserveBytes, func(reserved, written int64) { c.settleBytes(reserved, written) })
+			want := tc.err
+			if want == nil {
+				want = tc.wantErr
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("copy error = %v, want %v", err, want)
+			}
+			if n != int64(dst.got) {
+				t.Fatalf("copy reported %d bytes, destination accepted %d", n, dst.got)
+			}
+			c.usage.mu.Lock()
+			inflight, pending := c.usage.inflight, c.usage.pending+c.usage.retryBytes
+			c.usage.mu.Unlock()
+			if inflight != 0 {
+				t.Fatalf("in-flight reservation leaked: %d bytes", inflight)
+			}
+			if pending != int64(dst.got) {
+				t.Fatalf("accounted %d bytes, want the %d actually written", pending, dst.got)
+			}
+			if got := c.bytesRelayed.Load(); got != int64(dst.got) {
+				t.Fatalf("carrier bytesRelayed = %d, want %d", got, dst.got)
+			}
+		})
+	}
+}
