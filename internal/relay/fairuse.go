@@ -105,6 +105,7 @@ type tunnelUsage struct {
 	lastLevel      fairUseLevel
 	lastRefusalLog time.Time
 	pending        int64
+	inflight       int64 // bytes reserved by the copy path but not yet settled
 	flushMu        sync.Mutex
 	retryBytes     int64
 	retryBatchID   string
@@ -313,17 +314,56 @@ func stopTunnelUsage(usages []*tunnelUsage) {
 }
 
 func (u *tunnelUsage) add(n int64) bool {
-	if n <= 0 {
+	return u.settleCopy(0, n)
+}
+
+// reserveCopy admits n bytes the copy path is about to forward. In shared-store
+// mode the bytes count as in flight until settleCopy, so the splice directions of
+// one tunnel cannot together forward past the crash-loss bound before either
+// records its chunk. A refused reservation means the chunk must not be sent.
+func (u *tunnelUsage) reserveCopy(n int64) bool {
+	if n <= 0 || u.parent.store == nil {
 		return true
 	}
+	ok, overBound := u.tryReserveCopy(n)
+	if ok || !overBound {
+		return ok
+	}
+	u.shedOverBound()
+	ok, _ = u.tryReserveCopy(n)
+	return ok
+}
+
+func (u *tunnelUsage) tryReserveCopy(n int64) (ok, overBound bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.stopping {
+		return false, false
+	}
+	if u.pending+u.retryBytes+u.inflight+n >= fairUseCrashLossMax {
+		return false, true
+	}
+	u.inflight += n
+	return true, false
+}
+
+// settleCopy records the written bytes of a chunk against its reservation. The
+// reservation and the written bytes swap under one lock, so the forwarded
+// bytes are never briefly uncounted.
+func (u *tunnelUsage) settleCopy(reserved, written int64) bool {
 	if u.parent.store != nil {
 		now := u.parent.clock()
 		u.mu.Lock()
+		u.inflight -= reserved
+		if written <= 0 {
+			u.mu.Unlock()
+			return true
+		}
 		if u.stopping {
 			u.mu.Unlock()
 			return false
 		}
-		u.pending += n
+		u.pending += written
 		u.lastSeen = now
 		full := u.pending >= fairUseBatchBytes
 		u.mu.Unlock()
@@ -335,6 +375,10 @@ func (u *tunnelUsage) add(n int64) bool {
 		}
 		u.shedOverBound()
 		return u.pendingWithinBound()
+	}
+	n := written
+	if n <= 0 {
+		return true
 	}
 	now := u.parent.clock()
 	u.mu.Lock()
@@ -716,7 +760,7 @@ func (l *fairUseLimiter) sharedPressure() (pendingBytes, reservations int64) {
 	l.mu.Lock()
 	for _, usage := range l.tunnels {
 		usage.mu.Lock()
-		pendingBytes += usage.pending + usage.retryBytes
+		pendingBytes += usage.pending + usage.retryBytes + usage.inflight
 		usage.mu.Unlock()
 	}
 	l.mu.Unlock()

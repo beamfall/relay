@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -11,7 +12,7 @@ import (
 func TestCopyWithLimitEnforcesByteRate(t *testing.T) {
 	limiter := newByteLimiter(512, 512)
 	start := time.Now()
-	n, err := copyWithLimit(context.Background(), io.Discard, bytes.NewReader(bytes.Repeat([]byte{'x'}, 1024)), limiter, nil)
+	n, err := copyWithLimit(context.Background(), io.Discard, bytes.NewReader(bytes.Repeat([]byte{'x'}, 1024)), limiter, nil, nil)
 	if err != nil {
 		t.Fatalf("copy with limit: %v", err)
 	}
@@ -33,7 +34,7 @@ func TestCopyWithLimitBoundsThroughputNearRate(t *testing.T) {
 	const total = 2 << 20 // 2 MiB => ~1s of accrual beyond the initial burst
 	limiter := newByteLimiter(rate, rate)
 	start := time.Now()
-	n, err := copyWithLimit(context.Background(), io.Discard, bytes.NewReader(bytes.Repeat([]byte{'x'}, total)), limiter, nil)
+	n, err := copyWithLimit(context.Background(), io.Discard, bytes.NewReader(bytes.Repeat([]byte{'x'}, total)), limiter, nil, nil)
 	if err != nil {
 		t.Fatalf("copy with limit: %v", err)
 	}
@@ -268,5 +269,37 @@ func TestCtxSleepHonorsCancellation(t *testing.T) {
 	ctxSleep(ctx, time.Hour)
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("ctxSleep ignored cancellation: slept %s", elapsed)
+	}
+}
+
+// CORE-1407: a refused fair-use reservation stops the copy before the chunk
+// reaches the destination, and every admitted chunk is settled with the bytes
+// actually written.
+func TestCopyWithLimitReservesBeforeWriting(t *testing.T) {
+	var dst bytes.Buffer
+	admitted := 0
+	var settled []int64
+	n, err := copyWithLimit(context.Background(), &dst, bytes.NewReader(bytes.Repeat([]byte{'x'}, 3*int(fairUseCopyChunkMax))), nil,
+		func(n int64) bool {
+			if admitted == 2 {
+				return false
+			}
+			admitted++
+			return true
+		},
+		func(reserved, written int64) {
+			if reserved != written {
+				t.Errorf("settled reserved=%d written=%d, want a full write", reserved, written)
+			}
+			settled = append(settled, written)
+		})
+	if !errors.Is(err, errFairUseBound) {
+		t.Fatalf("copy error = %v, want errFairUseBound", err)
+	}
+	if want := 2 * fairUseCopyChunkMax; n != want || int64(dst.Len()) != want {
+		t.Fatalf("copied %d (dst %d), want only the %d admitted bytes", n, dst.Len(), want)
+	}
+	if len(settled) != 2 {
+		t.Fatalf("settled %d chunks, want 2", len(settled))
 	}
 }

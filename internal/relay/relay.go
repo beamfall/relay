@@ -1382,9 +1382,11 @@ const abruptSpliceDeadline = 250 * time.Millisecond
 func (s *Server) splice(ctx context.Context, carrier *carrier, upstream net.Conn, client net.Conn, clientReader io.Reader) {
 	done := make(chan spliceResult, 2)
 	copyBytes := func(dst io.Writer, src io.Reader) {
-		_, err := copyWithLimit(ctx, dst, src, carrier.limiter, func(n int64) {
-			s.metrics.bytesRelayed.Add(n)
-			if !carrier.recordBytes(n) {
+		_, err := copyWithLimit(ctx, dst, src, carrier.limiter, carrier.reserveBytes, func(reserved, written int64) {
+			if written > 0 {
+				s.metrics.bytesRelayed.Add(written)
+			}
+			if !carrier.settleBytes(reserved, written) {
 				_ = upstream.Close()
 				_ = client.Close()
 			}
@@ -1428,19 +1430,29 @@ func (r *byteSliceReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func copyWithLimit(ctx context.Context, dst io.Writer, src io.Reader, limiter *byteLimiter, record func(int64)) (int64, error) {
-	buf := make([]byte, 32*1024)
+// errFairUseBound reports a chunk refused because forwarding it would exceed
+// the tunnel's fair-use crash-loss bound.
+var errFairUseBound = errors.New("relay: fair-use crash-loss bound reached")
+
+// copyWithLimit forwards src to dst in chunks of at most fairUseCopyChunkMax.
+// reserve, when set, admits each chunk before it is written; record, when set,
+// then receives the reserved and written byte counts, even for a failed write.
+func copyWithLimit(ctx context.Context, dst io.Writer, src io.Reader, limiter *byteLimiter, reserve func(int64) bool, record func(reserved, written int64)) (int64, error) {
+	buf := make([]byte, fairUseCopyChunkMax)
 	var written int64
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
 			limiter.Wait(ctx, nr)
+			if reserve != nil && !reserve(int64(nr)) {
+				return written, errFairUseBound
+			}
 			nw, ew := dst.Write(buf[:nr])
 			if nw > 0 {
 				written += int64(nw)
-				if record != nil {
-					record(int64(nw))
-				}
+			}
+			if record != nil {
+				record(int64(nr), int64(max(nw, 0)))
 			}
 			if ew != nil {
 				return written, ew
@@ -1579,6 +1591,26 @@ func (c *carrier) open() (net.Conn, func(), error) {
 		return nil, func() {}, err
 	}
 	return stream, release, nil
+}
+
+// reserveBytes admits a chunk against the tunnel's fair-use bound before the
+// copy path forwards it.
+func (c *carrier) reserveBytes(n int64) bool {
+	if c.usage == nil {
+		return true
+	}
+	return c.usage.reserveCopy(n)
+}
+
+// settleBytes records a forwarded chunk against its reservation.
+func (c *carrier) settleBytes(reserved, written int64) bool {
+	if c.usage == nil {
+		return c.recordBytes(written)
+	}
+	if written > 0 {
+		c.bytesRelayed.Add(written)
+	}
+	return c.usage.settleCopy(reserved, written)
 }
 
 func (c *carrier) recordBytes(n int64) bool {
