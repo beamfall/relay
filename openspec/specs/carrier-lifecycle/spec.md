@@ -1,7 +1,9 @@
 # carrier-lifecycle Specification
 
 ## Purpose
-TBD - created by archiving change superseded-carrier-stream-lifetime. Update Purpose after archive.
+How long a relay carrier session and its spliced streams live across token expiry and same-identity
+rotation: new streams follow the identity's live carrier, existing streams on a superseded carrier
+finish within a bounded time, and no session outlives the identity's live authority.
 
 ## Requirements
 
