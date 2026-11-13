@@ -12,5 +12,5 @@
 ## 3. Verify and close
 
 - [x] 3.1 Run `openspec validate --all --strict`
-- [ ] 3.2 Run `make gate`
-- [ ] 3.3 Run `openspec archive superseded-carrier-stream-lifetime` after landing, before completing CORE-1382
+- [x] 3.2 Run `make gate`
+- [x] 3.3 Run `openspec archive superseded-carrier-stream-lifetime` after landing, before completing CORE-1382
