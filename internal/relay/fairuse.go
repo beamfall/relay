@@ -518,8 +518,14 @@ func (u *tunnelUsage) flushDirect(ctx context.Context) bool {
 		return u.parent.store.Healthy()
 	}
 	if !fromRetry {
+		// Park the batch in the retry slot while the store call is in flight, so
+		// pendingWithinBound and sharedPressure still count bytes that are neither
+		// pending nor durably stored. Otherwise a slow failing Add lets the copy
+		// loop admit a further crash-loss window of unaccounted bytes.
 		u.mu.Lock()
 		u.pending -= batch
+		u.retryBytes = batch
+		u.retryBatchID = batchID
 		u.mu.Unlock()
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)

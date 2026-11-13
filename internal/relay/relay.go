@@ -125,6 +125,14 @@ type Config struct {
 	// New streams route to the replacement immediately. Unsuperseded carriers
 	// still close at token expiry. Negative values are treated as zero.
 	ExpiredSessionDrain time.Duration
+	// SupersededStreamMaxAge is how long past its own token expiry a superseded
+	// carrier may keep its existing streams while a live carrier of the same
+	// identity still holds one of its hostnames. Core rotates carriers well
+	// inside the token TTL, so this lets a long relayed connection outlive the
+	// token that admitted its carrier. When no live same-identity carrier
+	// remains, ExpiredSessionDrain applies from that moment. Zero (the default)
+	// disables the extension; negative values are treated as zero.
+	SupersededStreamMaxAge time.Duration
 	// YamuxStreamWindowBytes overrides the v1 (TLS/TCP+yamux) carrier's
 	// per-stream flow-control window. <=0 uses
 	// protocol.DefaultYamuxStreamWindowBytes (1 MiB). The tunnel client MUST be
@@ -163,6 +171,8 @@ type Server struct {
 	streamWG               sync.WaitGroup // tracks in-flight relayed public streams (for drain)
 	shutdownGrace          time.Duration
 	expiredSessionDrain    time.Duration
+	supersededMaxAge       time.Duration
+	supersededPoll         time.Duration      // how often an expired superseded carrier rechecks for a live successor
 	cancelInternal         context.CancelFunc // cancels internalCtx; unblocks accept-loop backoff sleeps on Close
 	closeOnce              sync.Once
 	wg                     sync.WaitGroup
@@ -259,6 +269,9 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.ExpiredSessionDrain < 0 {
 		cfg.ExpiredSessionDrain = 0
 	}
+	if cfg.SupersededStreamMaxAge < 0 {
+		cfg.SupersededStreamMaxAge = 0
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -319,6 +332,8 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		carrierHandshakeT:      cfg.CarrierHandshakeTimeout,
 		shutdownGrace:          cfg.ShutdownGrace,
 		expiredSessionDrain:    cfg.ExpiredSessionDrain,
+		supersededMaxAge:       cfg.SupersededStreamMaxAge,
+		supersededPoll:         supersededSuccessorPoll,
 		yamuxStreamWindowBytes: cfg.YamuxStreamWindowBytes,
 		publicRejectLog:        newPublicRejectSampler(publicRejectLogSampleInterval, time.Now),
 	}
@@ -1133,16 +1148,8 @@ func (s *Server) awaitCarrierEnd(ctx context.Context, session protocol.Session, 
 		_ = session.Close()
 		<-session.CloseChan()
 	case <-timer.C:
-		if carrier != nil && carrier.isDraining() && s.expiredSessionDrain > 0 {
-			timer.Reset(s.expiredSessionDrain)
-			select {
-			case <-session.CloseChan():
-				return
-			case <-ctx.Done():
-				return
-			case <-drained:
-			case <-timer.C:
-			}
+		if carrier != nil && carrier.isDraining() && s.holdSupersededCarrier(ctx, session, carrier) {
+			return
 		}
 		if s.redactConnLogs {
 			s.logger.Info("carrier token expired, tearing down session")
@@ -1151,6 +1158,55 @@ func (s *Server) awaitCarrierEnd(ctx context.Context, session protocol.Session, 
 		}
 		_ = session.Close()
 		<-session.CloseChan()
+	}
+}
+
+// supersededSuccessorPoll is how often an expired superseded carrier rechecks
+// whether a live same-identity carrier still holds its routes.
+const supersededSuccessorPoll = time.Second
+
+// holdSupersededCarrier keeps an expired, superseded carrier open for the
+// streams already on it. While a live same-identity carrier holds one of its
+// hostnames it waits up to supersededMaxAge; that successor is the identity's
+// current registration, which awaitCarrierEnd closes at its own token expiry,
+// so the identity's authority stays bounded by a valid token. Once no live
+// successor remains it waits at most expiredSessionDrain. It returns true when
+// the session ended or the server context was cancelled, and false when the
+// caller should close the session: its last stream finished or a bound elapsed.
+func (s *Server) holdSupersededCarrier(ctx context.Context, session protocol.Session, carrier *carrier) bool {
+	if s.supersededMaxAge > 0 && s.registry.hasLiveSuccessor(carrier) {
+		maxAge := time.NewTimer(s.supersededMaxAge)
+		defer maxAge.Stop()
+		poll := time.NewTicker(s.supersededPoll)
+		defer poll.Stop()
+		for s.registry.hasLiveSuccessor(carrier) {
+			select {
+			case <-session.CloseChan():
+				return true
+			case <-ctx.Done():
+				return true
+			case <-carrier.drained:
+				return false
+			case <-maxAge.C:
+				return false
+			case <-poll.C:
+			}
+		}
+	}
+	if s.expiredSessionDrain <= 0 {
+		return false
+	}
+	drain := time.NewTimer(s.expiredSessionDrain)
+	defer drain.Stop()
+	select {
+	case <-session.CloseChan():
+		return true
+	case <-ctx.Done():
+		return true
+	case <-carrier.drained:
+		return false
+	case <-drain.C:
+		return false
 	}
 }
 
@@ -1568,6 +1624,20 @@ func (r *registry) unregister(c *carrier) {
 		}
 	}
 	delete(r.hostsFor, c)
+}
+
+// hasLiveSuccessor reports whether a different, still-open carrier of c's
+// identity currently holds any hostname c registered. A superseded carrier is
+// never in byHost, so the holder is the identity's current registration.
+func (r *registry) hasLiveSuccessor(c *carrier) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, host := range r.hostsFor[c] {
+		if cur := r.byHost[host]; cur != nil && cur != c && cur.id == c.id && !cur.session.IsClosed() {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *registry) lookup(host string) *carrier {

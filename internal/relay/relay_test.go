@@ -203,6 +203,72 @@ func TestTokenExpiryTakeoverDrainAllowsInflightStreamToComplete(t *testing.T) {
 	}
 }
 
+// CORE-1382: core rotates carriers inside the token TTL, so a relayed stream
+// that outlives its carrier's token must keep flowing while a replacement is
+// live, and is cut only by SupersededStreamMaxAge.
+func TestSupersededCarrierStreamOutlivesTokenWhileReplacementLive(t *testing.T) {
+	got := relayGappedStreamAcrossRotation(t, 30*time.Second)
+	if want := "before-expiryafter-expiry"; string(got) != want {
+		t.Fatalf("stream body = %q, want %q", got, want)
+	}
+}
+
+func TestSupersededCarrierStreamCutAtMaxAge(t *testing.T) {
+	got := relayGappedStreamAcrossRotation(t, 200*time.Millisecond)
+	if strings.Contains(string(got), "after-expiry") {
+		t.Fatalf("stream survived SupersededStreamMaxAge: %q", got)
+	}
+}
+
+// relayGappedStreamAcrossRotation holds one public stream open for 2.5s, well
+// past its carrier's one-second token plus the 500ms ExpiredSessionDrain, while
+// the tunnel client rotates carriers every 500ms, and returns what it read.
+func relayGappedStreamAcrossRotation(t *testing.T, maxAge time.Duration) []byte {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := startHomeTLSGappedStreamer(t, testHost, []byte("before-expiry"), []byte("after-expiry"), 2500*time.Millisecond)
+	defer home.Close()
+	node := startRelay(t, ctx, relay.Config{
+		TokenVerifier:          oneSecondExpiryVerifier{},
+		StreamCap:              8,
+		ExpiredSessionDrain:    500 * time.Millisecond,
+		SupersededStreamMaxAge: maxAge,
+	})
+	defer node.Close()
+
+	var tokenNonce atomic.Uint32
+	client, err := tunnel.Start(ctx, tunnel.Config{
+		RelayAddr:   node.CarrierAddr(),
+		BackendAddr: home.Addr(),
+		TokenProvider: func(context.Context) ([]byte, error) {
+			return []byte{byte(tokenNonce.Add(1))}, nil
+		},
+		TokenRotationInterval: 500 * time.Millisecond,
+		Hostnames:             []string{testHost},
+		TLSConfig:             &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13},
+		BackoffMin:            5 * time.Millisecond,
+		BackoffMax:            10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("start tunnel client: %v", err)
+	}
+	defer client.Close()
+	if err := client.WaitReady(ctx); err != nil {
+		t.Fatalf("tunnel client not ready: %v", err)
+	}
+
+	conn := dialPublicTLS(t, node.PublicAddr(), testHost, home.Roots)
+	defer conn.Close() //nolint:errcheck // test connection cleanup.
+	if _, err := conn.Write([]byte("start\n")); err != nil {
+		t.Fatalf("start stream: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	got, _ := io.ReadAll(conn)
+	return got
+}
+
 // TestRelayPassesQUICBytesEndToEnd pins the ADR-0018 §1 v2 QUIC carrier: the
 // same public-TLS-passthrough round-trip as the v1 yamux carrier, but the
 // tunnel client dials the relay's QUIC carrier listener instead of the
