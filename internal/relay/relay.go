@@ -44,6 +44,16 @@ const (
 	// hitting one rejection reason cannot spam the log at one line per
 	// connection.
 	publicRejectLogSampleInterval = time.Minute
+
+	// DefaultMaxCarrierConns is the default authenticated-carrier cap: about
+	// 128 home servers, each briefly holding two carriers during rotation.
+	DefaultMaxCarrierConns = 256
+	// DefaultMaxPendingCarrierConns is the default cap on carrier connections
+	// that have not yet authenticated.
+	DefaultMaxPendingCarrierConns = 64
+	// DefaultMaxPendingCarrierConnsPerSource is the default cap on
+	// unauthenticated carrier connections from one IPv4 /32 or IPv6 /64.
+	DefaultMaxPendingCarrierConnsPerSource = 8
 )
 
 type Config struct {
@@ -105,15 +115,32 @@ type Config struct {
 	// connection. A shorter deadline shrinks the window a partial-record flood
 	// can pin a public slot. <=0 uses a default.
 	PublicPeekTimeout time.Duration
-	// MaxCarrierConns bounds the number of concurrently-handled carrier
-	// connections. Carriers are few and known, so a modest cap suffices; over it
-	// accepts are immediately closed so a flood on the carrier port cannot
-	// exhaust goroutines/FDs (the public path is already gated this way). <=0
-	// uses a default.
+	// MaxCarrierConns bounds authenticated carrier sessions. A connection takes
+	// one of these slots only after its token verifies, so unauthenticated
+	// connections can never refuse a valid carrier; over the cap an
+	// authenticated carrier is refused with an "over capacity" error frame.
+	// Core opens a replacement carrier every two minutes and the superseded one
+	// stays until its streams drain, so each home server briefly holds two
+	// slots: size this for twice the number of home servers. <=0 uses a default
+	// (256, about 128 home servers).
 	MaxCarrierConns int
+	// MaxPendingCarrierConns bounds carrier connections that have not yet
+	// authenticated: those waiting out a handshake backoff and those in the
+	// handshake itself. Over it accepts are closed immediately so a flood on
+	// the carrier port cannot exhaust goroutines/FDs. <=0 uses a default (64).
+	MaxPendingCarrierConns int
+	// MaxPendingCarrierConnsPerSource bounds pending carrier connections from
+	// one source (IPv4 /32, IPv6 /64), so one source cannot hold the whole
+	// pending budget. Over it accepts are closed immediately. <=0 uses a
+	// default (8).
+	MaxPendingCarrierConnsPerSource int
 	// CarrierHandshakeTimeout bounds how long the server waits for the first
 	// carrier frame before reaping the connection. <=0 uses a default.
 	CarrierHandshakeTimeout time.Duration
+	// listenCarrier replaces net.Listen for the TCP carrier listener. It is an
+	// in-package test seam (nil in production) that lets tests present distinct
+	// source addresses over loopback.
+	listenCarrier func(network, address string) (net.Listener, error)
 	// ShutdownGrace bounds how long shutdown waits for in-flight relayed
 	// streams to finish before force-closing carrier sessions. On shutdown the
 	// public listener is closed first (no new connections accepted), then active
@@ -154,8 +181,9 @@ type Server struct {
 	acceptRetries          atomic.Int64
 	readiness              *relayReadinessState
 	publicSlots            chan struct{}         // semaphore bounding concurrent public conns
-	carrierAdmissions      chan struct{}         // semaphore bounding carrier conns waiting before slot reservation
-	carrierSlots           chan struct{}         // semaphore bounding concurrent carrier conns
+	carrierAdmissions      chan struct{}         // semaphore bounding unauthenticated (pending) carrier conns
+	carrierPendingPerIP    *perIPLimiter         // bounds pending carrier conns per IPv4 /32 or IPv6 /64
+	carrierSlots           chan struct{}         // semaphore bounding authenticated carrier sessions
 	publicPerIP            *perIPLimiter         // bounds public conns per IPv4 /32 or IPv6 /64
 	publicPerCarrier       *sourceCarrierLimiter // bounds streams per source prefix and carrier
 	publicPeekT            time.Duration         // TLS ClientHello peek deadline (SNI-blind routing)
@@ -248,7 +276,13 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		cfg.PublicPeekTimeout = 3 * time.Second
 	}
 	if cfg.MaxCarrierConns <= 0 {
-		cfg.MaxCarrierConns = 64
+		cfg.MaxCarrierConns = DefaultMaxCarrierConns
+	}
+	if cfg.MaxPendingCarrierConns <= 0 {
+		cfg.MaxPendingCarrierConns = DefaultMaxPendingCarrierConns
+	}
+	if cfg.MaxPendingCarrierConnsPerSource <= 0 {
+		cfg.MaxPendingCarrierConnsPerSource = DefaultMaxPendingCarrierConnsPerSource
 	}
 	if cfg.CarrierHandshakeTimeout <= 0 {
 		cfg.CarrierHandshakeTimeout = 10 * time.Second
@@ -272,7 +306,11 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		fairUse.close()
 		return nil, fmt.Errorf("listen public: %w", err)
 	}
-	carrierTCP, err := net.Listen("tcp", cfg.CarrierAddr)
+	listenCarrier := net.Listen
+	if cfg.listenCarrier != nil {
+		listenCarrier = cfg.listenCarrier
+	}
+	carrierTCP, err := listenCarrier("tcp", cfg.CarrierAddr)
 	if err != nil {
 		publicListener.Close() //nolint:errcheck // best-effort cleanup after carrier listen failure.
 		fairUse.close()
@@ -311,7 +349,8 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		redactConnLogs:         cfg.RedactConnectionLogs == nil || *cfg.RedactConnectionLogs,
 		readiness:              readiness,
 		publicSlots:            make(chan struct{}, cfg.MaxPublicConns),
-		carrierAdmissions:      make(chan struct{}, cfg.MaxCarrierConns),
+		carrierAdmissions:      make(chan struct{}, cfg.MaxPendingCarrierConns),
+		carrierPendingPerIP:    newPerIPLimiter(cfg.MaxPendingCarrierConnsPerSource),
 		carrierSlots:           make(chan struct{}, cfg.MaxCarrierConns),
 		publicPerIP:            newPerIPLimiter(cfg.MaxPublicConnsPerIP),
 		publicPerCarrier:       newSourceCarrierLimiter(cfg.MaxStreamsPerIPPerCarrier),
@@ -586,45 +625,66 @@ func (s *Server) acceptCarriers(ctx context.Context) {
 			continue
 		}
 		retryDelay = 0
-		// Bound connections before spawning their backoff goroutine. The separate
-		// admission semaphore preserves the guarantee that backoff sleeps hold no
-		// carrier slot while preventing those sleeps from accumulating unbounded
-		// goroutines and file descriptors.
-		select {
-		case s.carrierAdmissions <- struct{}{}:
-		default:
-			s.metrics.carrierOverCap.Add(1)
+		// Bound unauthenticated connections before spawning their goroutine, in
+		// total and per source, so neither a flood nor one source can pile up
+		// goroutines and file descriptors or hold every pending admission
+		// (CORE-1385).
+		endPending, ok := s.admitPendingCarrier(conn.RemoteAddr())
+		if !ok {
 			_ = conn.Close()
 			continue
 		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			defer func() { <-s.carrierAdmissions }()
-			// Back off a repeat-offender source BEFORE reserving a carrier slot,
-			// so a bad-token flood cannot pin the slots for the backoff-sleep
-			// duration (SECREV-RELAY-8). The sleep holds no slot; slots are
-			// reserved only for connections about to attempt a real handshake.
+			defer endPending()
+			// Back off a repeat-offender source before its handshake. The sleep
+			// holds only a pending admission, never a carrier slot
+			// (SECREV-RELAY-8).
 			s.handshakeThrottle.backoffBefore(ctx, conn.RemoteAddr())
-			// Bound concurrently-handled carrier connections, mirroring acceptPublic.
-			// Carrier handlers are long-lived (they block until the yamux session
-			// closes), so the slot is held for the carrier's lifetime — exactly the
-			// cap we want. Over the cap, close immediately so a flood on the carrier
-			// port cannot exhaust goroutines/FDs.
-			select {
-			case s.carrierSlots <- struct{}{}:
-			default:
-				s.metrics.carrierOverCap.Add(1)
-				_ = conn.Close()
-				return
-			}
-			defer func() { <-s.carrierSlots }()
-			s.handleCarrierConn(ctx, conn)
+			s.handleCarrierConn(ctx, conn, endPending)
 		}()
 	}
 }
 
-func (s *Server) handleCarrierConn(ctx context.Context, conn net.Conn) {
+// admitPendingCarrier reserves a pending (unauthenticated) admission for a new
+// carrier connection from remote, capped in total and per source. It returns
+// an idempotent release, run once the handshake is decided.
+func (s *Server) admitPendingCarrier(remote net.Addr) (func(), bool) {
+	source := sourcePrefix(remote)
+	if !s.carrierPendingPerIP.acquire(source) {
+		s.metrics.carrierPendingPerSourceOverCap.Add(1)
+		return nil, false
+	}
+	select {
+	case s.carrierAdmissions <- struct{}{}:
+	default:
+		s.carrierPendingPerIP.release(source)
+		s.metrics.carrierOverCap.Add(1)
+		return nil, false
+	}
+	return sync.OnceFunc(func() {
+		<-s.carrierAdmissions
+		s.carrierPendingPerIP.release(source)
+	}), true
+}
+
+// reserveCarrierSlot takes an authenticated-carrier slot, held for the
+// carrier's lifetime. It runs after the token verifies and before the Ack, so
+// only authenticated carriers compete for slots. Over MaxCarrierConns it
+// writes an "over capacity" error frame, which clients treat as retryable.
+func (s *Server) reserveCarrierSlot(rw protocol.FrameReadWriter) (func(), bool) {
+	select {
+	case s.carrierSlots <- struct{}{}:
+		return func() { <-s.carrierSlots }, true
+	default:
+		s.metrics.carrierOverCap.Add(1)
+		_ = protocol.WriteFrame(rw, protocol.Frame{Type: protocol.FrameError, Error: "over capacity"})
+		return nil, false
+	}
+}
+
+func (s *Server) handleCarrierConn(ctx context.Context, conn net.Conn, endPending func()) {
 	defer conn.Close() //nolint:errcheck // carrier connection cleanup.
 	// Bound the handshake: a carrier that connects and sends nothing must not
 	// hold a goroutine indefinitely. Mirrors the public SNI-peek deadline posture.
@@ -632,9 +692,15 @@ func (s *Server) handleCarrierConn(ctx context.Context, conn net.Conn) {
 		_ = conn.SetReadDeadline(time.Now().Add(s.carrierHandshakeT))
 	}
 	verified, ok := s.carrierHandshake(ctx, conn, conn.RemoteAddr())
+	endPending()
 	if !ok {
 		return
 	}
+	releaseSlot, ok := s.reserveCarrierSlot(conn)
+	if !ok {
+		return
+	}
+	defer releaseSlot()
 	// Handshake frame read; clear the deadline so the long-lived yamux session
 	// is not subject to the handshake timeout.
 	_ = conn.SetReadDeadline(time.Time{})
@@ -663,32 +729,21 @@ func (s *Server) acceptQUICCarriers(ctx context.Context) {
 			continue
 		}
 		retryDelay = 0
-		// Share the TCP carrier admission budget so neither transport can build an
-		// unbounded queue of pre-slot backoff goroutines or connections.
-		select {
-		case s.carrierAdmissions <- struct{}{}:
-		default:
-			s.metrics.carrierOverCap.Add(1)
+		// Share the TCP pending budgets so neither transport can build an
+		// unbounded queue of unauthenticated goroutines or connections.
+		endPending, ok := s.admitPendingCarrier(conn.RemoteAddr())
+		if !ok {
 			_ = conn.CloseWithError(0, "carrier admission over cap")
 			continue
 		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			defer func() { <-s.carrierAdmissions }()
-			// Back off a repeat-offender source BEFORE reserving a carrier slot,
-			// so a bad-token flood cannot pin the slots for the backoff-sleep
-			// duration (SECREV-RELAY-8). Mirrors the TCP acceptCarriers posture.
+			defer endPending()
+			// Back off a repeat-offender source before its handshake, holding no
+			// carrier slot (SECREV-RELAY-8). Mirrors acceptCarriers.
 			s.handshakeThrottle.backoffBefore(ctx, conn.RemoteAddr())
-			select {
-			case s.carrierSlots <- struct{}{}:
-			default:
-				s.metrics.carrierOverCap.Add(1)
-				_ = conn.CloseWithError(0, "carrier over cap")
-				return
-			}
-			defer func() { <-s.carrierSlots }()
-			s.handleQUICCarrierConn(ctx, conn)
+			s.handleQUICCarrierConn(ctx, conn, endPending)
 		}()
 	}
 }
@@ -729,7 +784,7 @@ func nextAcceptRetryDelay(delay time.Duration) time.Duration {
 	return delay
 }
 
-func (s *Server) handleQUICCarrierConn(ctx context.Context, conn *quic.Conn) {
+func (s *Server) handleQUICCarrierConn(ctx context.Context, conn *quic.Conn, endPending func()) {
 	defer conn.CloseWithError(0, "") //nolint:errcheck // carrier connection cleanup.
 	// The handshake Hello/Ack exchange happens on the first stream the client
 	// opens (a QUIC connection has no connection-level byte stream of its own).
@@ -742,6 +797,7 @@ func (s *Server) handleQUICCarrierConn(ctx context.Context, conn *quic.Conn) {
 	hsStream, err := conn.AcceptStream(hsCtx)
 	if err != nil {
 		s.metrics.handshakeFailures.Add(1)
+		s.handshakeThrottle.recordFailure(conn.RemoteAddr())
 		if s.redactConnLogs {
 			s.logger.Warn("quic carrier handshake stream failed", "err", err)
 		} else {
@@ -757,9 +813,15 @@ func (s *Server) handleQUICCarrierConn(ctx context.Context, conn *quic.Conn) {
 		_ = hsStream.SetReadDeadline(time.Now().Add(s.carrierHandshakeT))
 	}
 	verified, ok := s.carrierHandshake(ctx, hsStream, conn.RemoteAddr())
+	endPending()
 	if !ok {
 		return
 	}
+	releaseSlot, ok := s.reserveCarrierSlot(hsStream)
+	if !ok {
+		return
+	}
+	defer releaseSlot()
 	// Handshake frame read; clear the deadline so the long-lived stream is not
 	// subject to the handshake timeout.
 	_ = hsStream.SetReadDeadline(time.Time{})
@@ -783,6 +845,9 @@ func (s *Server) carrierHandshake(ctx context.Context, rw protocol.FrameReadWrit
 
 	frame, err := protocol.ReadFrame(rw)
 	if err != nil {
+		// A handshake timeout or truncated frame counts against the source like
+		// a bad token, so idling through the timeout is not free (CORE-1385).
+		s.handshakeThrottle.recordFailure(remote)
 		setHandshakeOutcome(span, dialOutcomeError)
 		s.metrics.recordDial(dialOutcomeError)
 		s.metrics.handshakeFailures.Add(1)
@@ -794,6 +859,7 @@ func (s *Server) carrierHandshake(ctx context.Context, rw protocol.FrameReadWrit
 		return VerifiedCarrier{}, false
 	}
 	if frame.Type != protocol.FrameHello || frame.Hello == nil || frame.Hello.Version != protocol.Version {
+		s.handshakeThrottle.recordFailure(remote)
 		setHandshakeOutcome(span, dialOutcomeInvalid)
 		s.metrics.recordDial(dialOutcomeInvalid)
 		s.metrics.handshakeFailures.Add(1)
@@ -802,6 +868,7 @@ func (s *Server) carrierHandshake(ctx context.Context, rw protocol.FrameReadWrit
 	}
 	surface, err := protocol.HelloSurface(frame.Hello)
 	if err != nil {
+		s.handshakeThrottle.recordFailure(remote)
 		setHandshakeOutcome(span, dialOutcomeInvalid)
 		s.metrics.recordDial(dialOutcomeInvalid)
 		s.metrics.handshakeFailures.Add(1)
@@ -810,6 +877,7 @@ func (s *Server) carrierHandshake(ctx context.Context, rw protocol.FrameReadWrit
 	}
 	if surface == protocol.SurfaceCache {
 		if err := cache.ValidateTokenKey(frame.Hello.CacheVerificationKey); err != nil {
+			s.handshakeThrottle.recordFailure(remote)
 			setHandshakeOutcome(span, dialOutcomeInvalid)
 			s.metrics.recordDial(dialOutcomeInvalid)
 			s.metrics.handshakeFailures.Add(1)
@@ -817,10 +885,10 @@ func (s *Server) carrierHandshake(ctx context.Context, rw protocol.FrameReadWrit
 			return VerifiedCarrier{}, false
 		}
 	}
-	// The per-source backoff for repeated failed handshakes runs BEFORE the
-	// carrier slot is reserved (in acceptCarriers/acceptQUICCarriers), so the
-	// backoff-sleep never occupies a slot (SECREV-RELAY-8). Here we only record
-	// the outcome of this attempt to feed that pre-slot throttle.
+	// The per-source backoff for repeated failed handshakes runs before the
+	// handshake (in acceptCarriers/acceptQUICCarriers) and never occupies a
+	// carrier slot (SECREV-RELAY-8). Here we only record the outcome of this
+	// attempt to feed that throttle.
 	verified, err := s.verifyCarrierToken(ctx, frame.Hello.Token, frame.Hello.Hostnames, surface, frame.Hello.CacheVerificationKey)
 	if err != nil {
 		outcome := carrierDialOutcome(err)

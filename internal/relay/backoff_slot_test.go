@@ -261,8 +261,9 @@ func startBackoffTestRelay(t *testing.T, ctx context.Context) *Server {
 			CarrierID: "carrier-1",
 			Hostnames: []string{"home.relay.test"},
 		},
-		MaxCarrierConns: 1,
-		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxCarrierConns:        1,
+		MaxPendingCarrierConns: 1,
+		Logger:                 slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("start relay: %v", err)

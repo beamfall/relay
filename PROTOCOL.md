@@ -20,9 +20,11 @@ The relay sends an error frame and immediately closes the connection when:
 - Token verification fails — the `TokenVerifier` seam returned `ErrUnauthorized` or any error —
   reason `"unauthorized"`. Repeated unauthorized attempts from the same source IP are subject to
   exponential back-off **before** the token check runs (brute-force throttle on the carrier port).
-  Note: the back-off applies only to the token-verify path. `"invalid hello"` paths (version
-  mismatch, malformed frame) close immediately without accumulating back-off; flood risk on that
-  path is bounded by `MaxCarrierConns`, not the throttle.
+  Invalid hellos and handshakes that time out or end before a full hello frame count toward the
+  same per-source back-off. Unauthenticated connections are also capped in total and per source
+  (IPv4 /32, IPv6 /64); over those caps the relay closes the connection without a frame.
+- The token verified but the relay already holds its maximum number of authenticated carrier
+  sessions — reason `"over capacity"`. Unauthenticated connections never hold these slots.
 
 Error frame schema:
 
@@ -31,8 +33,8 @@ Error frame schema:
 ```
 
 No further frames follow an error frame. On receipt the carrier must close the connection. After
-`"unauthorized"` it may reconnect using the same exponential back-off schedule as connection-loss
-reconnect (`backoffMin`–`backoffMax`); after `"invalid hello"` it should not retry until the
+`"unauthorized"` or `"over capacity"` it may reconnect using the same exponential back-off
+schedule as connection-loss reconnect (`backoffMin`–`backoffMax`); after `"invalid hello"` it should not retry until the
 carrier software is updated (version mismatch).
 
 ## Reconnect and carrier lifecycle

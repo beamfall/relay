@@ -96,6 +96,7 @@ func TestAcceptCarriersRetriesTemporaryErrorAndServesConnection(t *testing.T) {
 	s := newAcceptRetryTestServer()
 	s.carrierListener = listener
 	s.carrierAdmissions = make(chan struct{}, 1)
+	s.carrierPendingPerIP = newPerIPLimiter(1)
 	s.carrierSlots = make(chan struct{}, 1)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -126,6 +127,7 @@ func TestAcceptQUICCarriersRetriesTemporaryErrorAndServesConnection(t *testing.T
 	s := newAcceptRetryTestServer()
 	s.quicListener = listener
 	s.carrierAdmissions = make(chan struct{}, 1)
+	s.carrierPendingPerIP = newPerIPLimiter(1)
 	s.carrierSlots = make(chan struct{}, 1)
 
 	ctx, cancel := context.WithCancel(context.Background())

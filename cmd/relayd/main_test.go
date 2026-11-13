@@ -43,14 +43,19 @@ func TestCertReloadBuildRelayConfigUsesDynamicCertificate(t *testing.T) {
 // silently pinned to the 1024 default.
 func TestBuildRelayConfigHonorsMaxPublicConns(t *testing.T) {
 	cfg := buildRelayConfig(relaydFlags{
-		maxPublicConns:  2048,
-		maxCarrierConns: 64,
+		maxPublicConns:         2048,
+		maxCarrierConns:        512,
+		maxPendingCarrierConns: 96,
+		maxPendingCarrierPerIP: 4,
 	})
 	if cfg.MaxPublicConns != 2048 {
 		t.Fatalf("MaxPublicConns = %d, want 2048 (operator override must be honored)", cfg.MaxPublicConns)
 	}
-	if cfg.MaxCarrierConns != 64 {
-		t.Fatalf("MaxCarrierConns = %d, want 64", cfg.MaxCarrierConns)
+	if cfg.MaxCarrierConns != 512 {
+		t.Fatalf("MaxCarrierConns = %d, want 512", cfg.MaxCarrierConns)
+	}
+	if cfg.MaxPendingCarrierConns != 96 || cfg.MaxPendingCarrierConnsPerSource != 4 {
+		t.Fatalf("pending carrier caps = %d/%d, want 96/4", cfg.MaxPendingCarrierConns, cfg.MaxPendingCarrierConnsPerSource)
 	}
 }
 
