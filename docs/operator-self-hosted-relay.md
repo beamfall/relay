@@ -40,7 +40,8 @@ missing row as a doc bug, not a flag to skip.
 | `--rate-burst-bytes` | *(flag-only)* | rate value | per-carrier byte rate burst |
 | `--stream-cap` | `RELAYD_STREAM_CAP` | `64` | per-carrier concurrent stream cap |
 | `--shutdown-grace` | *(flag-only)* | `30s` | on shutdown, wait this long for in-flight streams to drain before force-close; `0` = immediate |
-| `--expired-session-drain` | *(flag-only)* | `30s` | additional grace after token expiry for streams on a superseded carrier to drain |
+| `--expired-session-drain` | *(flag-only)* | `30s` | grace for streams on a superseded carrier to drain once it is past token expiry and no live same-identity carrier remains |
+| `--superseded-stream-max-age` | *(flag-only)* | `4h` | how long past its token expiry a superseded carrier may keep existing streams while a live same-identity carrier holds its hostnames; `0` restores the cut at `expires-at` plus `--expired-session-drain` |
 | `--yamux-stream-window-bytes` | *(flag-only)* | `0` (uses the 4 MiB built-in default) | v1 (TLS/TCP) carrier per-stream flow-control window; the tunnel client's matching flag MUST agree. One stream moves about half a window per round trip (4 MiB ≈ 40 MB/s at 50 ms); a stalled reader can hold up to one window, so worst-case buffering is `--max-public-conns` × window |
 | `--redact-connection-logs` | `RELAYD_REDACT_CONNECTION_LOGS` | `true` | omit public remote address, SNI hostname, and carrier id from connection logs |
 | `--fair-use-enabled` | `RELAYD_FAIR_USE_ENABLED` | `false` | enable rolling-window fair-use accounting and hard-limit throttling |
@@ -217,8 +218,12 @@ expiring, replay-resistant v2 tunnel tokens:
 - The relay **refuses a token past its expires-at** and **refuses a nonce it has already seen**
   within the token's validity window. The client proactively registers a fresh same-identity
   carrier at about half the TTL, so new streams move before expiry. Existing streams on the old
-  carrier may drain until `expires-at` plus `--expired-session-drain` (default `30s`); without a
-  successful replacement the old carrier is still torn down exactly at expiry. No revocation list
+  carrier keep flowing past its `expires-at` while a live same-identity carrier holds its
+  hostnames, for up to `--superseded-stream-max-age` (default `4h`); once no live replacement
+  remains they get `--expired-session-drain` (default `30s`) more. Because the live replacement is
+  itself closed at its own expiry, an identity that stops receiving tokens loses every carrier
+  within one more TTL plus the drain. Without a successful replacement the old carrier is still
+  torn down exactly at expiry. No revocation list
   is fetched and no verify-time network call is made — the claim is entirely self-contained.
 - In HMAC mode, `relayd` persists admitted nonces at
   `/var/lib/beamfall-relay/hmac-nonces.json` and fails startup if that state cannot be opened,

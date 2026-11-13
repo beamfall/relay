@@ -152,6 +152,14 @@ type Config struct {
 	// New streams route to the replacement immediately. Unsuperseded carriers
 	// still close at token expiry. Negative values are treated as zero.
 	ExpiredSessionDrain time.Duration
+	// SupersededStreamMaxAge is how long past its own token expiry a superseded
+	// carrier may keep its existing streams while a live carrier of the same
+	// identity still holds one of its hostnames. Core rotates carriers well
+	// inside the token TTL, so this lets a long relayed connection outlive the
+	// token that admitted its carrier. When no live same-identity carrier
+	// remains, ExpiredSessionDrain applies from that moment. Zero (the default)
+	// disables the extension; negative values are treated as zero.
+	SupersededStreamMaxAge time.Duration
 	// YamuxStreamWindowBytes overrides the v1 (TLS/TCP+yamux) carrier's
 	// per-stream flow-control window. <=0 uses
 	// protocol.DefaultYamuxStreamWindowBytes (4 MiB). The tunnel client MUST be
@@ -191,6 +199,8 @@ type Server struct {
 	streamWG               sync.WaitGroup // tracks in-flight relayed public streams (for drain)
 	shutdownGrace          time.Duration
 	expiredSessionDrain    time.Duration
+	supersededMaxAge       time.Duration
+	supersededPoll         time.Duration      // how often an expired superseded carrier rechecks for a live successor
 	cancelInternal         context.CancelFunc // cancels internalCtx; unblocks accept-loop backoff sleeps on Close
 	closeOnce              sync.Once
 	wg                     sync.WaitGroup
@@ -293,6 +303,9 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.ExpiredSessionDrain < 0 {
 		cfg.ExpiredSessionDrain = 0
 	}
+	if cfg.SupersededStreamMaxAge < 0 {
+		cfg.SupersededStreamMaxAge = 0
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -358,6 +371,8 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		carrierHandshakeT:      cfg.CarrierHandshakeTimeout,
 		shutdownGrace:          cfg.ShutdownGrace,
 		expiredSessionDrain:    cfg.ExpiredSessionDrain,
+		supersededMaxAge:       cfg.SupersededStreamMaxAge,
+		supersededPoll:         supersededSuccessorPoll,
 		yamuxStreamWindowBytes: cfg.YamuxStreamWindowBytes,
 		publicRejectLog:        newPublicRejectSampler(publicRejectLogSampleInterval, time.Now),
 	}
@@ -1005,6 +1020,7 @@ func (s *Server) serveCarrierSession(ctx context.Context, rw protocol.FrameReadW
 		fairUse:       s.fairUse,
 		tunnelsActive: &s.metrics.tunnelsActive,
 		drained:       make(chan struct{}),
+		expiresAt:     verified.ExpiresAt,
 	}
 	if s.fairUse != nil {
 		// Resolve the per-carrier usage entry once at connect time. The byte hot path
@@ -1201,16 +1217,8 @@ func (s *Server) awaitCarrierEnd(ctx context.Context, session protocol.Session, 
 		_ = session.Close()
 		<-session.CloseChan()
 	case <-timer.C:
-		if carrier != nil && carrier.isDraining() && s.expiredSessionDrain > 0 {
-			timer.Reset(s.expiredSessionDrain)
-			select {
-			case <-session.CloseChan():
-				return
-			case <-ctx.Done():
-				return
-			case <-drained:
-			case <-timer.C:
-			}
+		if carrier != nil && carrier.isDraining() && s.holdSupersededCarrier(ctx, session, carrier, verified.ExpiresAt) {
+			return
 		}
 		if s.redactConnLogs {
 			s.logger.Info("carrier token expired, tearing down session")
@@ -1220,6 +1228,74 @@ func (s *Server) awaitCarrierEnd(ctx context.Context, session protocol.Session, 
 		_ = session.Close()
 		<-session.CloseChan()
 	}
+}
+
+// supersededSuccessorPoll is how often an expired superseded carrier rechecks
+// whether a live same-identity carrier still holds its routes.
+const supersededSuccessorPoll = time.Second
+
+// holdSupersededCarrier keeps an expired, superseded carrier open for the
+// streams already on it. While a live successor (hasLiveSuccessor) holds one of
+// its hostnames it waits until expiresAt+supersededMaxAge. That successor holds
+// an unexpired token, so the identity's authority stays bounded by a valid
+// token. Once no live successor remains it waits at most expiredSessionDrain.
+// When supersededMaxAge is set, it never waits past that deadline, even if
+// the successor was already gone at expiry. It returns true when the session
+// ended or the server context was cancelled, and false when the caller should
+// close the session: its last stream finished or a bound elapsed.
+func (s *Server) holdSupersededCarrier(ctx context.Context, session protocol.Session, carrier *carrier, expiresAt time.Time) bool {
+	drainFor := s.expiredSessionDrain
+	if s.supersededMaxAge > 0 {
+		deadline := expiresAt.Add(s.supersededMaxAge)
+		if s.registry.hasLiveSuccessor(carrier) && !s.awaitSuccessorLoss(ctx, session, carrier, deadline) {
+			return session.IsClosed() || ctx.Err() != nil
+		}
+		drainFor = min(drainFor, time.Until(deadline))
+	}
+	if drainFor <= 0 {
+		return false
+	}
+	drain := time.NewTimer(drainFor)
+	defer drain.Stop()
+	select {
+	case <-session.CloseChan():
+		return true
+	case <-ctx.Done():
+		return true
+	case <-carrier.drained:
+		return false
+	case <-drain.C:
+		return false
+	}
+}
+
+// awaitSuccessorLoss waits while a live successor holds one of carrier's
+// hostnames. It returns true once no live successor remains, and false when
+// the session ended, ctx was cancelled, the last stream finished or the
+// deadline passed.
+func (s *Server) awaitSuccessorLoss(ctx context.Context, session protocol.Session, carrier *carrier, deadline time.Time) bool {
+	maxAge := time.NewTimer(time.Until(deadline))
+	defer maxAge.Stop()
+	interval := s.supersededPoll
+	if interval <= 0 {
+		interval = supersededSuccessorPoll
+	}
+	poll := time.NewTicker(interval)
+	defer poll.Stop()
+	for s.registry.hasLiveSuccessor(carrier) {
+		select {
+		case <-session.CloseChan():
+			return false
+		case <-ctx.Done():
+			return false
+		case <-carrier.drained:
+			return false
+		case <-maxAge.C:
+			return false
+		case <-poll.C:
+		}
+	}
+	return true
 }
 
 func (s *Server) handlePublicConn(ctx context.Context, conn net.Conn) {
@@ -1374,9 +1450,11 @@ const abruptSpliceDeadline = 250 * time.Millisecond
 func (s *Server) splice(ctx context.Context, carrier *carrier, upstream net.Conn, client net.Conn, clientReader io.Reader) {
 	done := make(chan spliceResult, 2)
 	copyBytes := func(dst io.Writer, src io.Reader) {
-		_, err := copyWithLimit(ctx, dst, src, carrier.limiter, func(n int64) {
-			s.metrics.bytesRelayed.Add(n)
-			if !carrier.recordBytes(n) {
+		_, err := copyWithLimit(ctx, dst, src, carrier.limiter, carrier.reserveBytes, func(reserved, written int64) {
+			if written > 0 {
+				s.metrics.bytesRelayed.Add(written)
+			}
+			if !carrier.settleBytes(reserved, written) {
 				_ = upstream.Close()
 				_ = client.Close()
 			}
@@ -1420,19 +1498,29 @@ func (r *byteSliceReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func copyWithLimit(ctx context.Context, dst io.Writer, src io.Reader, limiter *byteLimiter, record func(int64)) (int64, error) {
-	buf := make([]byte, 32*1024)
+// errFairUseBound reports a chunk refused because forwarding it would exceed
+// the tunnel's fair-use crash-loss bound.
+var errFairUseBound = errors.New("relay: fair-use crash-loss bound reached")
+
+// copyWithLimit forwards src to dst in chunks of at most fairUseCopyChunkMax.
+// reserve, when set, admits each chunk before it is written; record, when set,
+// then receives the reserved and written byte counts, even for a failed write.
+func copyWithLimit(ctx context.Context, dst io.Writer, src io.Reader, limiter *byteLimiter, reserve func(int64) bool, record func(reserved, written int64)) (int64, error) {
+	buf := make([]byte, fairUseCopyChunkMax)
 	var written int64
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
 			limiter.Wait(ctx, nr)
+			if reserve != nil && !reserve(int64(nr)) {
+				return written, errFairUseBound
+			}
 			nw, ew := dst.Write(buf[:nr])
 			if nw > 0 {
 				written += int64(nw)
-				if record != nil {
-					record(int64(nw))
-				}
+			}
+			if record != nil {
+				record(int64(nr), int64(max(nw, 0)))
 			}
 			if ew != nil {
 				return written, ew
@@ -1464,6 +1552,8 @@ type carrier struct {
 	draining      bool
 	drained       chan struct{}
 	drainOnce     sync.Once
+	// expiresAt is the verified token expiry; zero means no token deadline.
+	expiresAt time.Time
 }
 
 var errCarrierDraining = errors.New("carrier draining")
@@ -1571,6 +1661,26 @@ func (c *carrier) open() (net.Conn, func(), error) {
 	return stream, release, nil
 }
 
+// reserveBytes admits a chunk against the tunnel's fair-use bound before the
+// copy path forwards it.
+func (c *carrier) reserveBytes(n int64) bool {
+	if c.usage == nil {
+		return true
+	}
+	return c.usage.reserveCopy(n)
+}
+
+// settleBytes records a forwarded chunk against its reservation.
+func (c *carrier) settleBytes(reserved, written int64) bool {
+	if c.usage == nil {
+		return c.recordBytes(written)
+	}
+	if written > 0 {
+		c.bytesRelayed.Add(written)
+	}
+	return c.usage.settleCopy(reserved, written)
+}
+
 func (c *carrier) recordBytes(n int64) bool {
 	if n <= 0 {
 		return true
@@ -1636,6 +1746,27 @@ func (r *registry) unregister(c *carrier) {
 		}
 	}
 	delete(r.hostsFor, c)
+}
+
+// hasLiveSuccessor reports whether a different carrier of c's identity that
+// still has authority holds any hostname c registered: open, not itself
+// superseded, and with an unexpired token. A superseded carrier can stay in
+// byHost for hostnames its replacement did not claim, so it must not count, or
+// expired carriers could extend each other along a partial-hostname chain.
+func (r *registry) hasLiveSuccessor(c *carrier) bool {
+	now := time.Now()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, host := range r.hostsFor[c] {
+		cur := r.byHost[host]
+		if cur == nil || cur == c || cur.id != c.id || cur.session.IsClosed() || cur.isDraining() {
+			continue
+		}
+		if cur.expiresAt.IsZero() || now.Before(cur.expiresAt) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *registry) lookup(host string) *carrier {

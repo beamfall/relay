@@ -119,6 +119,7 @@ func main() {
 		fairUseFenceMargin       = flag.Duration("fair-use-fence-margin", fairUseFenceMarginDefault, "redis fair-use mode only: the relay closes a stream this long before its unconfirmed lease can expire in Redis")
 		shutdownGrace            = flag.Duration("shutdown-grace", 30*time.Second, "on shutdown, stop accepting new public connections then wait this long for in-flight streams to drain before force-close; 0 = immediate")
 		expiredSessionDrain      = flag.Duration("expired-session-drain", 30*time.Second, "additional grace after token expiry for streams on a superseded carrier to drain; unsuperseded carriers still close at expiry")
+		supersededStreamMaxAge   = flag.Duration("superseded-stream-max-age", 4*time.Hour, "how long past its token expiry a superseded carrier may keep existing streams while a live same-identity carrier holds its hostnames; 0 restores the expired-session-drain cut")
 		redactConnectionLogs     = flag.Bool("redact-connection-logs", redactConnectionLogsDefault, "omit public remote address, SNI hostname, and carrier id from connection logs")
 		yamuxStreamWindowBytes   = flag.Int("yamux-stream-window-bytes", 0, "v1 (TLS/TCP) carrier per-stream flow-control window in bytes; 0 uses the 4 MiB default. The tunnel client's --yamux-stream-window-bytes MUST match.")
 	)
@@ -185,6 +186,7 @@ func main() {
 		rateBurst:                *rateBurst,
 		shutdownGrace:            *shutdownGrace,
 		expiredSessionDrain:      *expiredSessionDrain,
+		supersededStreamMaxAge:   *supersededStreamMaxAge,
 		fairUseEnabled:           *fairUseEnabled,
 		fairUseWindowDays:        *fairUseWindowDays,
 		fairUseSoftLimitBytes:    *fairUseSoftLimitBytes,
@@ -489,6 +491,7 @@ type relaydFlags struct {
 	rateBurst                int64
 	shutdownGrace            time.Duration
 	expiredSessionDrain      time.Duration
+	supersededStreamMaxAge   time.Duration
 	redactConnectionLogs     *bool
 	yamuxStreamWindowBytes   int
 	fairUseEnabled           bool
@@ -582,6 +585,7 @@ func buildRelayConfig(f relaydFlags) relay.Config {
 		RateBurstBytes:                  f.rateBurst,
 		ShutdownGrace:                   f.shutdownGrace,
 		ExpiredSessionDrain:             f.expiredSessionDrain,
+		SupersededStreamMaxAge:          f.supersededStreamMaxAge,
 		RedactConnectionLogs:            f.redactConnectionLogs,
 		YamuxStreamWindowBytes:          f.yamuxStreamWindowBytes,
 		FairUse: relay.FairUseConfig{

@@ -63,7 +63,7 @@ public streams that already opened a yamux sub-stream complete their own teardow
 | **Public SNI-peek deadline** | 5 s deadline passed as a call-site constant in `relay.go` to `sni.PeekClientHello` (the sni package itself accepts it as a parameter). | 5 s |
 | **yamux session lifetime** | No idle timeout. Lives until `CloseChan()` fires (TCP close, read/write error, or `session.Close()` on server shutdown). | unbounded |
 | **Shutdown grace** | On `Server.Shutdown`, the relay stops accepting new public connections and waits up to `ShutdownGrace` for in-flight relayed streams to drain before force-closing. Zero = immediate force-close. | configurable |
-| **Expired-session drain** | A same-identity replacement receives new streams immediately. Its superseded predecessor may retain existing streams through token expiry until they finish or `ExpiredSessionDrain` elapses. An unsuperseded carrier closes at expiry. | configurable |
+| **Expired-session drain** | A same-identity replacement receives new streams immediately. Its superseded predecessor retains only its existing streams and closes when the last one ends. Past its own token expiry it keeps them while a live same-identity carrier holds one of its hostnames, for at most `SupersededStreamMaxAge`; once no such carrier remains, for at most `ExpiredSessionDrain`. An unsuperseded carrier closes at expiry. | configurable |
 
 ## Version negotiation
 

@@ -37,10 +37,12 @@ the token's own already-verified, self-contained signed claim — **not** a fetc
 carrier tunnel tokens are a distinct, revocable token class under ADR-0018 §5). Because tokens carry
 a short TTL, the tunnel client proactively establishes a freshly authenticated carrier halfway
 through the validity window. The same-identity registration immediately receives all new public
-streams. The superseded session keeps only its existing streams until they finish, or until
-`expires-at` plus `--expired-session-drain` (30 seconds by default); a carrier that never establishes
-a replacement is still closed exactly at expiry. This bounds stale routing while avoiding a forced
-rebuffer for streams already in flight.
+streams. The superseded session keeps only its existing streams until they finish. Past its own
+`expires-at` it keeps them while a live same-identity carrier holds its hostnames, for up to
+`--superseded-stream-max-age` (4 hours by default), then for `--expired-session-drain` (30 seconds by
+default) once no live replacement remains; a carrier that never establishes a replacement is still
+closed exactly at expiry. This bounds stale routing to the identity's live authority while avoiding
+a forced cut for long streams already in flight.
 
 ## Horizontal-scaling approach (scoped, not built)
 
