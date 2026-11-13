@@ -952,6 +952,7 @@ func (s *Server) serveCarrierSession(ctx context.Context, rw protocol.FrameReadW
 		fairUse:       s.fairUse,
 		tunnelsActive: &s.metrics.tunnelsActive,
 		drained:       make(chan struct{}),
+		expiresAt:     verified.ExpiresAt,
 	}
 	if s.fairUse != nil {
 		// Resolve the per-carrier usage entry once at connect time. The byte hot path
@@ -1148,7 +1149,7 @@ func (s *Server) awaitCarrierEnd(ctx context.Context, session protocol.Session, 
 		_ = session.Close()
 		<-session.CloseChan()
 	case <-timer.C:
-		if carrier != nil && carrier.isDraining() && s.holdSupersededCarrier(ctx, session, carrier) {
+		if carrier != nil && carrier.isDraining() && s.holdSupersededCarrier(ctx, session, carrier, verified.ExpiresAt) {
 			return
 		}
 		if s.redactConnLogs {
@@ -1166,16 +1167,18 @@ func (s *Server) awaitCarrierEnd(ctx context.Context, session protocol.Session, 
 const supersededSuccessorPoll = time.Second
 
 // holdSupersededCarrier keeps an expired, superseded carrier open for the
-// streams already on it. While a live same-identity carrier holds one of its
-// hostnames it waits up to supersededMaxAge; that successor is the identity's
-// current registration, which awaitCarrierEnd closes at its own token expiry,
-// so the identity's authority stays bounded by a valid token. Once no live
-// successor remains it waits at most expiredSessionDrain. It returns true when
-// the session ended or the server context was cancelled, and false when the
-// caller should close the session: its last stream finished or a bound elapsed.
-func (s *Server) holdSupersededCarrier(ctx context.Context, session protocol.Session, carrier *carrier) bool {
+// streams already on it. While a live successor (hasLiveSuccessor) holds one of
+// its hostnames it waits until expiresAt+supersededMaxAge. That successor holds
+// an unexpired token, so the identity's authority stays bounded by a valid
+// token. Once no live successor remains it waits at most expiredSessionDrain,
+// and never past the same max-age deadline. It returns true when the session
+// ended or the server context was cancelled, and false when the caller should
+// close the session: its last stream finished or a bound elapsed.
+func (s *Server) holdSupersededCarrier(ctx context.Context, session protocol.Session, carrier *carrier, expiresAt time.Time) bool {
+	drainFor := s.expiredSessionDrain
 	if s.supersededMaxAge > 0 && s.registry.hasLiveSuccessor(carrier) {
-		maxAge := time.NewTimer(s.supersededMaxAge)
+		deadline := expiresAt.Add(s.supersededMaxAge)
+		maxAge := time.NewTimer(time.Until(deadline))
 		defer maxAge.Stop()
 		interval := s.supersededPoll
 		if interval <= 0 {
@@ -1196,11 +1199,12 @@ func (s *Server) holdSupersededCarrier(ctx context.Context, session protocol.Ses
 			case <-poll.C:
 			}
 		}
+		drainFor = min(drainFor, time.Until(deadline))
 	}
-	if s.expiredSessionDrain <= 0 {
+	if drainFor <= 0 {
 		return false
 	}
-	drain := time.NewTimer(s.expiredSessionDrain)
+	drain := time.NewTimer(drainFor)
 	defer drain.Stop()
 	select {
 	case <-session.CloseChan():
@@ -1456,6 +1460,8 @@ type carrier struct {
 	draining      bool
 	drained       chan struct{}
 	drainOnce     sync.Once
+	// expiresAt is the verified token expiry; zero means no token deadline.
+	expiresAt time.Time
 }
 
 var errCarrierDraining = errors.New("carrier draining")
@@ -1630,14 +1636,21 @@ func (r *registry) unregister(c *carrier) {
 	delete(r.hostsFor, c)
 }
 
-// hasLiveSuccessor reports whether a different, still-open carrier of c's
-// identity currently holds any hostname c registered. A superseded carrier is
-// never in byHost, so the holder is the identity's current registration.
+// hasLiveSuccessor reports whether a different carrier of c's identity that
+// still has authority holds any hostname c registered: open, not itself
+// superseded, and with an unexpired token. A superseded carrier can stay in
+// byHost for hostnames its replacement did not claim, so it must not count, or
+// expired carriers could extend each other along a partial-hostname chain.
 func (r *registry) hasLiveSuccessor(c *carrier) bool {
+	now := time.Now()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, host := range r.hostsFor[c] {
-		if cur := r.byHost[host]; cur != nil && cur != c && cur.id == c.id && !cur.session.IsClosed() {
+		cur := r.byHost[host]
+		if cur == nil || cur == c || cur.id != c.id || cur.session.IsClosed() || cur.isDraining() {
+			continue
+		}
+		if cur.expiresAt.IsZero() || now.Before(cur.expiresAt) {
 			return true
 		}
 	}

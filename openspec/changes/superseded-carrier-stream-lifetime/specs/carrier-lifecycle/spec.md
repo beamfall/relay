@@ -5,8 +5,8 @@
 When a carrier is superseded by a same-identity replacement and its token expires, the relay SHALL
 keep the superseded carrier's existing streams open while a live carrier of the same identity holds
 at least one of the superseded carrier's hostnames, for at most `SupersededStreamMaxAge` after the
-superseded carrier's token expiry. A `SupersededStreamMaxAge` of zero SHALL disable this
-extension.
+superseded carrier's token expiry. A live carrier is open, not itself superseded, and holds an
+unexpired token. A `SupersededStreamMaxAge` of zero SHALL disable this extension.
 
 #### Scenario: Long stream outlives its carrier's token
 
@@ -19,6 +19,18 @@ extension.
 - **WHEN** a superseded carrier's streams are still open `SupersededStreamMaxAge` after its token
   expiry
 - **THEN** the relay closes the carrier and its streams
+
+#### Scenario: Replacement lost just before the maximum age
+
+- **WHEN** the live replacement ends shortly before `SupersededStreamMaxAge` after the superseded
+  carrier's token expiry
+- **THEN** the relay still closes the superseded carrier by that maximum age
+
+#### Scenario: Superseded carriers do not extend each other
+
+- **WHEN** an expired superseded carrier shares a hostname only with another superseded carrier
+- **THEN** that other carrier does not count as live and the expired carrier closes within
+  `ExpiredSessionDrain`
 
 #### Scenario: Extension disabled
 
