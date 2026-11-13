@@ -352,14 +352,20 @@ func TestCopyWithLimitSettlesShortAndFailedWrites(t *testing.T) {
 			if n != int64(dst.got) {
 				t.Fatalf("copy reported %d bytes, destination accepted %d", n, dst.got)
 			}
+			// The flush worker may already have committed the bytes; flushMu is
+			// held across a commit, so pending, retry and committed bytes read
+			// under it are a consistent split of everything accounted.
+			c.usage.flushMu.Lock()
 			c.usage.mu.Lock()
-			inflight, pending := c.usage.inflight, c.usage.pending+c.usage.retryBytes
+			inflight := c.usage.inflight
+			accounted := c.usage.pending + c.usage.retryBytes + store.addedBytes.Load()
 			c.usage.mu.Unlock()
+			c.usage.flushMu.Unlock()
 			if inflight != 0 {
 				t.Fatalf("in-flight reservation leaked: %d bytes", inflight)
 			}
-			if pending != int64(dst.got) {
-				t.Fatalf("accounted %d bytes, want the %d actually written", pending, dst.got)
+			if accounted != int64(dst.got) {
+				t.Fatalf("accounted %d bytes, want the %d actually written", accounted, dst.got)
 			}
 			if got := c.bytesRelayed.Load(); got != int64(dst.got) {
 				t.Fatalf("carrier bytesRelayed = %d, want %d", got, dst.got)
