@@ -145,18 +145,19 @@ type metrics struct {
 	// registered public route. Cache carriers and passthrough carriers with no
 	// accepted routes are tracked separately so /readyz cannot mistake either
 	// for a serving public route; the exported metric sums both counters.
-	carriersConnected           atomic.Int64
-	nonServingCarriersConnected atomic.Int64
-	tunnelsActive               atomic.Int64
-	streamsActive               atomic.Int64
-	bytesRelayed                atomic.Int64
-	handshakeFailures           atomic.Int64
-	fairUseRefusals             atomic.Int64
-	publicOverCap               atomic.Int64
-	publicPerIPOverCap          atomic.Int64
-	carrierOverCap              atomic.Int64
-	fairUse                     *fairUseLimiter
-	carrierReadiness            carrierReadiness
+	carriersConnected              atomic.Int64
+	nonServingCarriersConnected    atomic.Int64
+	tunnelsActive                  atomic.Int64
+	streamsActive                  atomic.Int64
+	bytesRelayed                   atomic.Int64
+	handshakeFailures              atomic.Int64
+	fairUseRefusals                atomic.Int64
+	publicOverCap                  atomic.Int64
+	publicPerIPOverCap             atomic.Int64
+	carrierOverCap                 atomic.Int64
+	carrierPendingPerSourceOverCap atomic.Int64
+	fairUse                        *fairUseLimiter
+	carrierReadiness               carrierReadiness
 	// nonceCache is set (relay.go Start) only when the configured
 	// TokenVerifier implements nonceCacheSnapshotter. Nil means the running
 	// verifier has no such cache; the gauges are then omitted from the
@@ -264,8 +265,11 @@ func (m *metrics) newMetricsRegistry() *prometheus.Registry {
 		"Public connections rejected for exceeding the per-source-IP concurrency cap.",
 		m.publicPerIPOverCap.Load)
 	counter("beamfall_relay_carrier_over_cap_total",
-		"Carrier connections rejected for exceeding the carrier concurrency cap.",
+		"Carrier connections rejected for exceeding the pending or authenticated carrier cap.",
 		m.carrierOverCap.Load)
+	counter("beamfall_relay_carrier_pending_per_source_over_cap_total",
+		"Unauthenticated carrier connections rejected for exceeding the per-source pending cap.",
+		m.carrierPendingPerSourceOverCap.Load)
 	counter("beamfall_relay_fairuse_refused_connections_total",
 		"New connections refused because a tunnel was over its hard fair-use limit.",
 		m.fairUseRefusals.Load)

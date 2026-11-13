@@ -2,12 +2,12 @@
 //
 // The v1 carrier multiplexes every relayed stream over one yamux session on
 // top of a single TLS/TCP connection, so all streams share one congestion
-// window and one 1 MiB yamux stream window: a loss event on one stream (or a
+// window and one yamux stream window (4 MiB by default): a loss event on one stream (or a
 // high-bitrate stream saturating its window) stalls every other stream on the
 // same carrier. QUIC gives each stream its own flow-control window and loss
 // recovery, so a stalled or throttled stream no longer head-of-line-blocks
-// its siblings, and per-stream windows can be sized well past yamux's 1 MiB
-// cap without cross-stream interference.
+// its siblings, and per-stream windows can be sized well past yamux's default
+// window without cross-stream interference.
 //
 // QuicSession adapts *quic.Conn to the Session interface so relay.go and
 // tunnel/client.go drive both transports through the same seam.
@@ -27,7 +27,7 @@ import (
 // YamuxConfig's role for the v1 carrier.
 //
 //   - MaxStreamReceiveWindow / MaxConnectionReceiveWindow are set well past
-//     yamux's 1 MiB stream cap (8 MiB / 64 MiB) since QUIC's per-stream
+//     yamux's default stream window (8 MiB / 64 MiB) since QUIC's per-stream
 //     isolation means a large window on one stream no longer starves others;
 //     the window only needs to clear the bandwidth-delay product of a 4K
 //     remux on a long-RTT path (e.g. ~450 KiB at 60 Mbps / 60 ms RTT, before

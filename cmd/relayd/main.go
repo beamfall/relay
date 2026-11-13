@@ -102,7 +102,9 @@ func main() {
 		maxPublicConnsPerIP      = flag.Int("max-public-conns-per-ip", maxPublicConnsPerIPDefault, "max concurrently-handled public connections from one IPv4 /32 or IPv6 /64 (defense-in-depth against partial-record floods); over the cap accepts are closed; 0 uses the default")
 		maxStreamsPerCarrierIP   = flag.Int("max-streams-per-ip-per-carrier", maxStreamsPerCarrierIPDefault, "max concurrent streams from one IPv4 /32 or IPv6 /64 to one carrier; 0 uses one quarter of --stream-cap (minimum 1)")
 		publicPeekTimeout        = flag.Duration("public-peek-timeout", 3*time.Second, "how long the public listener waits to read a client's TLS ClientHello for SNI-blind routing before closing the connection; shorter shrinks the partial-record flood window; 0 uses the default")
-		maxCarrierConns          = flag.Int("max-carrier-conns", 64, "max concurrently-handled carrier connections; over the cap accepts are closed; 0 uses the default")
+		maxCarrierConns          = flag.Int("max-carrier-conns", relay.DefaultMaxCarrierConns, "max authenticated carrier sessions; size for twice the number of home servers (carrier rotation briefly holds two each); over the cap an authenticated carrier is refused with \"over capacity\"; 0 uses the default")
+		maxPendingCarrierConns   = flag.Int("max-pending-carrier-conns", relay.DefaultMaxPendingCarrierConns, "max carrier connections that have not yet authenticated (in backoff or handshake); over the cap accepts are closed; 0 uses the default")
+		maxPendingCarrierPerIP   = flag.Int("max-pending-carrier-conns-per-ip", relay.DefaultMaxPendingCarrierConnsPerSource, "max unauthenticated carrier connections from one IPv4 /32 or IPv6 /64; over the cap accepts are closed; 0 uses the default")
 		rateBytes                = flag.Int64("rate-bytes-per-sec", 0, "per-carrier byte rate limit; 0 disables")
 		rateBurst                = flag.Int64("rate-burst-bytes", 0, "per-carrier byte rate burst; defaults to rate")
 		fairUseEnabled           = flag.Bool("fair-use-enabled", fairUseEnabledDefault, "enable rolling-window fair-use accounting and hard-limit throttling")
@@ -119,7 +121,7 @@ func main() {
 		expiredSessionDrain      = flag.Duration("expired-session-drain", 30*time.Second, "additional grace after token expiry for streams on a superseded carrier to drain; unsuperseded carriers still close at expiry")
 		supersededStreamMaxAge   = flag.Duration("superseded-stream-max-age", 4*time.Hour, "how long past its token expiry a superseded carrier may keep existing streams while a live same-identity carrier holds its hostnames; 0 restores the expired-session-drain cut")
 		redactConnectionLogs     = flag.Bool("redact-connection-logs", redactConnectionLogsDefault, "omit public remote address, SNI hostname, and carrier id from connection logs")
-		yamuxStreamWindowBytes   = flag.Int("yamux-stream-window-bytes", 0, "v1 (TLS/TCP) carrier per-stream flow-control window in bytes; 0 uses the 1 MiB default. The tunnel client's --yamux-stream-window-bytes MUST match.")
+		yamuxStreamWindowBytes   = flag.Int("yamux-stream-window-bytes", 0, "v1 (TLS/TCP) carrier per-stream flow-control window in bytes; 0 uses the 4 MiB default. The tunnel client's --yamux-stream-window-bytes MUST match.")
 	)
 	flag.Parse()
 
@@ -178,6 +180,8 @@ func main() {
 		maxStreamsPerCarrierIP:   *maxStreamsPerCarrierIP,
 		publicPeekTimeout:        *publicPeekTimeout,
 		maxCarrierConns:          *maxCarrierConns,
+		maxPendingCarrierConns:   *maxPendingCarrierConns,
+		maxPendingCarrierPerIP:   *maxPendingCarrierPerIP,
 		rateBytes:                *rateBytes,
 		rateBurst:                *rateBurst,
 		shutdownGrace:            *shutdownGrace,
@@ -481,6 +485,8 @@ type relaydFlags struct {
 	maxStreamsPerCarrierIP   int
 	publicPeekTimeout        time.Duration
 	maxCarrierConns          int
+	maxPendingCarrierConns   int
+	maxPendingCarrierPerIP   int
 	rateBytes                int64
 	rateBurst                int64
 	shutdownGrace            time.Duration
@@ -567,19 +573,21 @@ func buildRelayConfig(f relaydFlags) relay.Config {
 			GetCertificate: f.getCertificate,
 			MinVersion:     tls.VersionTLS13,
 		},
-		TokenVerifier:          f.tokenVerifier,
-		StreamCap:              f.streamCap,
-		MaxPublicConns:         f.maxPublicConns,
-		MaxPublicConnsPerIP:    f.maxPublicConnsPerIP,
-		PublicPeekTimeout:      f.publicPeekTimeout,
-		MaxCarrierConns:        f.maxCarrierConns,
-		RateBytesPerSec:        f.rateBytes,
-		RateBurstBytes:         f.rateBurst,
-		ShutdownGrace:          f.shutdownGrace,
-		ExpiredSessionDrain:    f.expiredSessionDrain,
-		SupersededStreamMaxAge: f.supersededStreamMaxAge,
-		RedactConnectionLogs:   f.redactConnectionLogs,
-		YamuxStreamWindowBytes: f.yamuxStreamWindowBytes,
+		TokenVerifier:                   f.tokenVerifier,
+		StreamCap:                       f.streamCap,
+		MaxPublicConns:                  f.maxPublicConns,
+		MaxPublicConnsPerIP:             f.maxPublicConnsPerIP,
+		PublicPeekTimeout:               f.publicPeekTimeout,
+		MaxCarrierConns:                 f.maxCarrierConns,
+		MaxPendingCarrierConns:          f.maxPendingCarrierConns,
+		MaxPendingCarrierConnsPerSource: f.maxPendingCarrierPerIP,
+		RateBytesPerSec:                 f.rateBytes,
+		RateBurstBytes:                  f.rateBurst,
+		ShutdownGrace:                   f.shutdownGrace,
+		ExpiredSessionDrain:             f.expiredSessionDrain,
+		SupersededStreamMaxAge:          f.supersededStreamMaxAge,
+		RedactConnectionLogs:            f.redactConnectionLogs,
+		YamuxStreamWindowBytes:          f.yamuxStreamWindowBytes,
 		FairUse: relay.FairUseConfig{
 			Enabled:           f.fairUseEnabled,
 			WindowDays:        f.fairUseWindowDays,

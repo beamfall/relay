@@ -57,7 +57,7 @@ type Config struct {
 	Transport string
 	// YamuxStreamWindowBytes overrides the v1 (TransportTCP) carrier's
 	// per-stream flow-control window. <=0 uses
-	// protocol.DefaultYamuxStreamWindowBytes (1 MiB). Ignored for TransportQUIC.
+	// protocol.DefaultYamuxStreamWindowBytes (4 MiB). Ignored for TransportQUIC.
 	// MUST match the relay's relay.Config.YamuxStreamWindowBytes, since yamux
 	// requires both ends of a session to agree on window size.
 	YamuxStreamWindowBytes int

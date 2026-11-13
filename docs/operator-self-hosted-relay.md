@@ -33,14 +33,16 @@ missing row as a doc bug, not a flag to skip.
 | `--max-public-conns-per-ip` | `RELAYD_MAX_PUBLIC_CONNS_PER_IP` | `64` | per-source-prefix (IPv4 /32, IPv6 /64) concurrent public-connection cap; `0` uses the default |
 | `--max-streams-per-ip-per-carrier` | `RELAYD_MAX_STREAMS_PER_IP_PER_CARRIER` | one quarter of `--stream-cap`, min 1 | per-source-prefix, per-carrier concurrent-stream cap; `0` uses the derived default |
 | `--public-peek-timeout` | *(flag-only)* | `3s` | how long the public listener waits to read a ClientHello before closing; `0` uses the default |
-| `--max-carrier-conns` | *(flag-only)* | `64` | max concurrently-handled carrier connections; `0` uses the default |
+| `--max-carrier-conns` | *(flag-only)* | `256` | max authenticated carrier sessions; a connection takes a slot only after its token verifies. Core rotates its carrier every two minutes and the old one stays until its streams drain, so size this for **twice** the number of home servers (the default fits about 128). Over the cap an authenticated carrier is refused with `"over capacity"` and retries; `0` uses the default |
+| `--max-pending-carrier-conns` | *(flag-only)* | `64` | max carrier connections not yet authenticated (in handshake back-off or the handshake itself); over the cap accepts are closed; `0` uses the default |
+| `--max-pending-carrier-conns-per-ip` | *(flag-only)* | `8` | per-source-prefix (IPv4 /32, IPv6 /64) cap on unauthenticated carrier connections, so one source cannot hold the whole pending budget; `0` uses the default |
 | `--rate-bytes-per-sec` | *(flag-only)* | `0` (disabled) | per-carrier byte rate limit |
 | `--rate-burst-bytes` | *(flag-only)* | rate value | per-carrier byte rate burst |
 | `--stream-cap` | `RELAYD_STREAM_CAP` | `64` | per-carrier concurrent stream cap |
 | `--shutdown-grace` | *(flag-only)* | `30s` | on shutdown, wait this long for in-flight streams to drain before force-close; `0` = immediate |
 | `--expired-session-drain` | *(flag-only)* | `30s` | grace for streams on a superseded carrier to drain once it is past token expiry and no live same-identity carrier remains |
 | `--superseded-stream-max-age` | *(flag-only)* | `4h` | how long past its token expiry a superseded carrier may keep existing streams while a live same-identity carrier holds its hostnames; `0` restores the cut at `expires-at` plus `--expired-session-drain` |
-| `--yamux-stream-window-bytes` | *(flag-only)* | `0` (uses the 1 MiB built-in default) | v1 (TLS/TCP) carrier per-stream flow-control window; the tunnel client's matching flag MUST agree |
+| `--yamux-stream-window-bytes` | *(flag-only)* | `0` (uses the 4 MiB built-in default) | v1 (TLS/TCP) carrier per-stream flow-control window; the tunnel client's matching flag MUST agree. One stream moves about half a window per round trip (4 MiB ≈ 40 MB/s at 50 ms); a stalled reader can hold up to one window, so worst-case buffering is `--max-public-conns` × window |
 | `--redact-connection-logs` | `RELAYD_REDACT_CONNECTION_LOGS` | `true` | omit public remote address, SNI hostname, and carrier id from connection logs |
 | `--fair-use-enabled` | `RELAYD_FAIR_USE_ENABLED` | `false` | enable rolling-window fair-use accounting and hard-limit throttling |
 | `--fair-use-window-days` | `RELAYD_FAIR_USE_WINDOW_DAYS` | `30` | fair-use rolling window in days |
@@ -613,7 +615,7 @@ degrading the host:
 Both are conservative starting points derived from the shipped connection caps above — each
 public/carrier connection holds one file descriptor and, while relaying, a 32 KiB splice buffer
 per direction — not a benchmarked ceiling for your traffic. If you raise `--max-public-conns`,
-`--max-carrier-conns`, or `--stream-cap` well past their defaults, raise these limits
+`--max-carrier-conns`, `--max-pending-carrier-conns`, or `--stream-cap` well past their defaults, raise these limits
 proportionally and confirm the real ceiling against observed memory/fd usage
 (`systemctl status beamfall-relayd` or the container's cgroup stats) rather than trusting the
 shipped numbers unmeasured.
