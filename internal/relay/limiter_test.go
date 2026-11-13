@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -11,7 +12,7 @@ import (
 func TestCopyWithLimitEnforcesByteRate(t *testing.T) {
 	limiter := newByteLimiter(512, 512)
 	start := time.Now()
-	n, err := copyWithLimit(context.Background(), io.Discard, bytes.NewReader(bytes.Repeat([]byte{'x'}, 1024)), limiter, nil)
+	n, err := copyWithLimit(context.Background(), io.Discard, bytes.NewReader(bytes.Repeat([]byte{'x'}, 1024)), limiter, nil, nil)
 	if err != nil {
 		t.Fatalf("copy with limit: %v", err)
 	}
@@ -33,7 +34,7 @@ func TestCopyWithLimitBoundsThroughputNearRate(t *testing.T) {
 	const total = 2 << 20 // 2 MiB => ~1s of accrual beyond the initial burst
 	limiter := newByteLimiter(rate, rate)
 	start := time.Now()
-	n, err := copyWithLimit(context.Background(), io.Discard, bytes.NewReader(bytes.Repeat([]byte{'x'}, total)), limiter, nil)
+	n, err := copyWithLimit(context.Background(), io.Discard, bytes.NewReader(bytes.Repeat([]byte{'x'}, total)), limiter, nil, nil)
 	if err != nil {
 		t.Fatalf("copy with limit: %v", err)
 	}
@@ -268,5 +269,107 @@ func TestCtxSleepHonorsCancellation(t *testing.T) {
 	ctxSleep(ctx, time.Hour)
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("ctxSleep ignored cancellation: slept %s", elapsed)
+	}
+}
+
+// CORE-1407: a refused fair-use reservation stops the copy before the chunk
+// reaches the destination, and every admitted chunk is settled with the bytes
+// actually written.
+func TestCopyWithLimitReservesBeforeWriting(t *testing.T) {
+	var dst bytes.Buffer
+	admitted := 0
+	var settled []int64
+	n, err := copyWithLimit(context.Background(), &dst, bytes.NewReader(bytes.Repeat([]byte{'x'}, 3*int(fairUseCopyChunkMax))), nil,
+		func(n int64) bool {
+			if admitted == 2 {
+				return false
+			}
+			admitted++
+			return true
+		},
+		func(reserved, written int64) {
+			if reserved != written {
+				t.Errorf("settled reserved=%d written=%d, want a full write", reserved, written)
+			}
+			settled = append(settled, written)
+		})
+	if !errors.Is(err, errFairUseBound) {
+		t.Fatalf("copy error = %v, want errFairUseBound", err)
+	}
+	if want := 2 * fairUseCopyChunkMax; n != want || int64(dst.Len()) != want {
+		t.Fatalf("copied %d (dst %d), want only the %d admitted bytes", n, dst.Len(), want)
+	}
+	if len(settled) != 2 {
+		t.Fatalf("settled %d chunks, want 2", len(settled))
+	}
+}
+
+// shortWriter accepts at most limit bytes per call and then returns err.
+type shortWriter struct {
+	limit int
+	err   error
+	got   int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	n := min(len(p), w.limit)
+	w.got += n
+	return n, w.err
+}
+
+// CORE-1407: a chunk the destination only partly accepts, or rejects, still
+// releases its whole reservation and records only the bytes actually written.
+func TestCopyWithLimitSettlesShortAndFailedWrites(t *testing.T) {
+	cases := []struct {
+		name    string
+		limit   int
+		err     error
+		wantErr error
+	}{
+		{"partial write with error", 1000, errors.New("peer reset"), nil},
+		{"zero-byte failure", 0, errors.New("peer reset"), nil},
+		{"short write without error", 1000, nil, io.ErrShortWrite},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &countingFairUseStore{}
+			store.healthy.Store(true)
+			limiter := newFairUseLimiter(FairUseConfig{Enabled: true}, nil)
+			limiter.store = store
+			defer limiter.close()
+			c := &carrier{id: "opaque-server", fairUse: limiter, usage: limiter.tunnel("opaque-server")}
+			dst := &shortWriter{limit: tc.limit, err: tc.err}
+
+			n, err := copyWithLimit(context.Background(), dst, bytes.NewReader(bytes.Repeat([]byte{'x'}, int(fairUseCopyChunkMax))), nil,
+				c.reserveBytes, func(reserved, written int64) { c.settleBytes(reserved, written) })
+			want := tc.err
+			if want == nil {
+				want = tc.wantErr
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("copy error = %v, want %v", err, want)
+			}
+			if n != int64(dst.got) {
+				t.Fatalf("copy reported %d bytes, destination accepted %d", n, dst.got)
+			}
+			// The flush worker may already have committed the bytes; flushMu is
+			// held across a commit, so pending, retry and committed bytes read
+			// under it are a consistent split of everything accounted.
+			c.usage.flushMu.Lock()
+			c.usage.mu.Lock()
+			inflight := c.usage.inflight
+			accounted := c.usage.pending + c.usage.retryBytes + store.addedBytes.Load()
+			c.usage.mu.Unlock()
+			c.usage.flushMu.Unlock()
+			if inflight != 0 {
+				t.Fatalf("in-flight reservation leaked: %d bytes", inflight)
+			}
+			if accounted != int64(dst.got) {
+				t.Fatalf("accounted %d bytes, want the %d actually written", accounted, dst.got)
+			}
+			if got := c.bytesRelayed.Load(); got != int64(dst.got) {
+				t.Fatalf("carrier bytesRelayed = %d, want %d", got, dst.got)
+			}
+		})
 	}
 }

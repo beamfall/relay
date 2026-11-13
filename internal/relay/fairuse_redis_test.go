@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -620,4 +621,146 @@ func (s *interruptibleFairUseStore) uniqueBatchIDs() int {
 	s.batchMu.Lock()
 	defer s.batchMu.Unlock()
 	return len(s.batchIDs)
+}
+
+// CORE-1407: both splice directions of a tunnel copy at once. Each must reserve
+// its chunk before forwarding it, so together they cannot put more than the
+// crash-loss bound on the wire while the shared store refuses every commit.
+func TestFairUseConcurrentCopiesStayWithinCrashLossBound(t *testing.T) {
+	store := &countingFairUseStore{failAdd: true}
+	store.healthy.Store(true)
+	limiter := newFairUseLimiter(FairUseConfig{Enabled: true}, nil)
+	limiter.store = store
+	defer limiter.close()
+	usage := limiter.tunnel("opaque-server")
+
+	const producers = 8
+	var forwarded atomic.Int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range producers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for usage.reserveCopy(fairUseCopyChunkMax) {
+				// The chunk is on the wire but not yet recorded.
+				forwarded.Add(fairUseCopyChunkMax)
+				runtime.Gosched()
+				if !usage.settleCopy(fairUseCopyChunkMax, fairUseCopyChunkMax) {
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := forwarded.Load(); got >= fairUseCrashLossMax {
+		t.Fatalf("forwarded %d uncommitted bytes across %d copiers, must remain strictly below %d", got, producers, fairUseCrashLossMax)
+	}
+	usage.mu.Lock()
+	inflight, held := usage.inflight, usage.pending+usage.retryBytes
+	usage.mu.Unlock()
+	if inflight != 0 {
+		t.Fatalf("in-flight reservations = %d after every copier settled, want 0", inflight)
+	}
+	if held != forwarded.Load() {
+		t.Fatalf("uncommitted bytes held = %d, want every forwarded byte %d", held, forwarded.Load())
+	}
+	if store.addCalls.Load() == 0 {
+		t.Fatal("test did not exercise failed shared-store flush")
+	}
+}
+
+// CORE-1383: a batch whose direct commit is in flight stays counted as
+// uncommitted, stays retained when the commit fails, and is committed exactly
+// once when the retry succeeds.
+func TestFairUseDirectFlushCountsInFlightBatch(t *testing.T) {
+	store := &gatedFairUseStore{entered: make(chan fairUseAddCall), results: make(chan error)}
+	store.healthy.Store(true)
+	limiter := newFairUseLimiter(FairUseConfig{Enabled: true}, nil)
+	limiter.store = store
+	defer limiter.close()
+	usage := limiter.tunnel("opaque-server")
+
+	if !usage.add(fairUseBatchBytes) {
+		t.Fatal("first batch refused")
+	}
+	assertHeld := func(stage string) {
+		t.Helper()
+		usage.mu.Lock()
+		pending, retry := usage.pending, usage.retryBytes
+		usage.mu.Unlock()
+		if pending != 0 || retry != fairUseBatchBytes {
+			t.Fatalf("%s: pending=%d retry=%d, want the batch held in the retry slot", stage, pending, retry)
+		}
+		if got, _ := limiter.sharedPressure(); got != fairUseBatchBytes {
+			t.Fatalf("%s: shared pressure = %d, want %d", stage, got, fairUseBatchBytes)
+		}
+	}
+
+	first := store.awaitAdd(t)
+	assertHeld("first commit in flight")
+	store.results <- errors.New("backend unavailable")
+	retry := store.awaitAdd(t)
+	if retry != first {
+		t.Fatalf("retry committed %+v, want the retained batch %+v", retry, first)
+	}
+	assertHeld("retry in flight")
+	store.results <- nil
+	waitFairUseCondition(t, 5*time.Second, "successful retry never cleared the batch", func() bool {
+		usage.mu.Lock()
+		defer usage.mu.Unlock()
+		return usage.retryBytes == 0 && usage.retryBatchID == "" && usage.pending == 0
+	})
+	limiter.close()
+	if got := store.addedBytes.Load(); got != fairUseBatchBytes {
+		t.Fatalf("committed bytes = %d, want exactly one batch %d", got, fairUseBatchBytes)
+	}
+	if got := store.addCalls.Load(); got != 2 {
+		t.Fatalf("store commits = %d, want 2 (one failure, one success)", got)
+	}
+}
+
+type fairUseAddCall struct {
+	batchID string
+	bytes   int64
+}
+
+// gatedFairUseStore holds each commit until the test answers it.
+type gatedFairUseStore struct {
+	countingFairUseStore
+	entered chan fairUseAddCall
+	results chan error
+}
+
+func (s *gatedFairUseStore) Add(ctx context.Context, _ string, batchID string, bytes int64) (int64, error) {
+	s.addCalls.Add(1)
+	select {
+	case s.entered <- fairUseAddCall{batchID: batchID, bytes: bytes}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	select {
+	case err := <-s.results:
+		if err != nil {
+			return 0, err
+		}
+		s.addedBytes.Add(bytes)
+		return bytes, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (s *gatedFairUseStore) awaitAdd(t *testing.T) fairUseAddCall {
+	t.Helper()
+	select {
+	case call := <-s.entered:
+		return call
+	case <-time.After(5 * time.Second):
+		t.Fatal("no shared-store commit arrived")
+		return fairUseAddCall{}
+	}
 }

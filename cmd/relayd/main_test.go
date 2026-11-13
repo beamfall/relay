@@ -181,6 +181,7 @@ func TestBuildRelayConfigRunLoopFields(t *testing.T) {
 	cfg := buildRelayConfig(relaydFlags{
 		shutdownGrace:            grace,
 		expiredSessionDrain:      expiredDrain,
+		supersededStreamMaxAge:   90 * time.Minute,
 		redactConnectionLogs:     &redactConnectionLogs,
 		rateBytes:                1_000_000,
 		rateBurst:                2_000_000,
@@ -200,6 +201,9 @@ func TestBuildRelayConfigRunLoopFields(t *testing.T) {
 	}
 	if cfg.ExpiredSessionDrain != expiredDrain {
 		t.Errorf("ExpiredSessionDrain = %v, want %v", cfg.ExpiredSessionDrain, expiredDrain)
+	}
+	if cfg.SupersededStreamMaxAge != 90*time.Minute {
+		t.Errorf("SupersededStreamMaxAge = %v, want 90m", cfg.SupersededStreamMaxAge)
 	}
 	if cfg.RedactConnectionLogs == nil || *cfg.RedactConnectionLogs {
 		t.Errorf("RedactConnectionLogs = %v, want explicit false", cfg.RedactConnectionLogs)
