@@ -1177,7 +1177,11 @@ func (s *Server) holdSupersededCarrier(ctx context.Context, session protocol.Ses
 	if s.supersededMaxAge > 0 && s.registry.hasLiveSuccessor(carrier) {
 		maxAge := time.NewTimer(s.supersededMaxAge)
 		defer maxAge.Stop()
-		poll := time.NewTicker(s.supersededPoll)
+		interval := s.supersededPoll
+		if interval <= 0 {
+			interval = supersededSuccessorPoll
+		}
+		poll := time.NewTicker(interval)
 		defer poll.Stop()
 		for s.registry.hasLiveSuccessor(carrier) {
 			select {
