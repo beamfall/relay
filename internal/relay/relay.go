@@ -154,7 +154,7 @@ type Config struct {
 	ExpiredSessionDrain time.Duration
 	// YamuxStreamWindowBytes overrides the v1 (TLS/TCP+yamux) carrier's
 	// per-stream flow-control window. <=0 uses
-	// protocol.DefaultYamuxStreamWindowBytes (1 MiB). The tunnel client MUST be
+	// protocol.DefaultYamuxStreamWindowBytes (4 MiB). The tunnel client MUST be
 	// configured with the same value, since yamux requires both ends of a
 	// session to agree on window size.
 	YamuxStreamWindowBytes int

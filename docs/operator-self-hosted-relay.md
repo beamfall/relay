@@ -41,7 +41,7 @@ missing row as a doc bug, not a flag to skip.
 | `--stream-cap` | `RELAYD_STREAM_CAP` | `64` | per-carrier concurrent stream cap |
 | `--shutdown-grace` | *(flag-only)* | `30s` | on shutdown, wait this long for in-flight streams to drain before force-close; `0` = immediate |
 | `--expired-session-drain` | *(flag-only)* | `30s` | additional grace after token expiry for streams on a superseded carrier to drain |
-| `--yamux-stream-window-bytes` | *(flag-only)* | `0` (uses the 1 MiB built-in default) | v1 (TLS/TCP) carrier per-stream flow-control window; the tunnel client's matching flag MUST agree |
+| `--yamux-stream-window-bytes` | *(flag-only)* | `0` (uses the 4 MiB built-in default) | v1 (TLS/TCP) carrier per-stream flow-control window; the tunnel client's matching flag MUST agree. One stream moves about half a window per round trip (4 MiB ≈ 40 MB/s at 50 ms); a stalled reader can hold up to one window, so worst-case buffering is `--max-public-conns` × window |
 | `--redact-connection-logs` | `RELAYD_REDACT_CONNECTION_LOGS` | `true` | omit public remote address, SNI hostname, and carrier id from connection logs |
 | `--fair-use-enabled` | `RELAYD_FAIR_USE_ENABLED` | `false` | enable rolling-window fair-use accounting and hard-limit throttling |
 | `--fair-use-window-days` | `RELAYD_FAIR_USE_WINDOW_DAYS` | `30` | fair-use rolling window in days |

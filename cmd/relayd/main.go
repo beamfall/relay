@@ -120,7 +120,7 @@ func main() {
 		shutdownGrace            = flag.Duration("shutdown-grace", 30*time.Second, "on shutdown, stop accepting new public connections then wait this long for in-flight streams to drain before force-close; 0 = immediate")
 		expiredSessionDrain      = flag.Duration("expired-session-drain", 30*time.Second, "additional grace after token expiry for streams on a superseded carrier to drain; unsuperseded carriers still close at expiry")
 		redactConnectionLogs     = flag.Bool("redact-connection-logs", redactConnectionLogsDefault, "omit public remote address, SNI hostname, and carrier id from connection logs")
-		yamuxStreamWindowBytes   = flag.Int("yamux-stream-window-bytes", 0, "v1 (TLS/TCP) carrier per-stream flow-control window in bytes; 0 uses the 1 MiB default. The tunnel client's --yamux-stream-window-bytes MUST match.")
+		yamuxStreamWindowBytes   = flag.Int("yamux-stream-window-bytes", 0, "v1 (TLS/TCP) carrier per-stream flow-control window in bytes; 0 uses the 4 MiB default. The tunnel client's --yamux-stream-window-bytes MUST match.")
 	)
 	flag.Parse()
 
