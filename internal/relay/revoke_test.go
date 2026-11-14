@@ -150,3 +150,207 @@ func TestTakeoverDrain_AllowsInflightPastOneSecondExpiry(t *testing.T) {
 		t.Fatal("superseded carrier did not close after its in-flight stream drained")
 	}
 }
+
+// supersededPair registers an old and a new carrier of one identity for the
+// same host, so the old one is superseded (draining) with one in-flight stream.
+func supersededPair(t *testing.T, s *Server) (old, cur *carrier) {
+	t.Helper()
+	s.registry = newRegistry()
+	old = &carrier{id: "srv-1", session: newStubSession(), active: 1, drained: make(chan struct{})}
+	cur = &carrier{id: "srv-1", session: newStubSession(), drained: make(chan struct{})}
+	s.registry.register(old, []string{"h.example"})
+	s.registry.register(cur, []string{"h.example"})
+	if !old.isDraining() {
+		t.Fatal("old carrier not superseded")
+	}
+	return old, cur
+}
+
+func waitClosed(t *testing.T, session protocol.Session, within time.Duration, what string) {
+	t.Helper()
+	select {
+	case <-session.CloseChan():
+	case <-time.After(within):
+		t.Fatal(what)
+	}
+}
+
+// CORE-1382: a superseded carrier keeps its streams past its own token expiry
+// while a live same-identity carrier holds its host, and falls back to
+// ExpiredSessionDrain once that successor is gone.
+func TestSupersededHold_KeepsStreamsWhileSuccessorLive(t *testing.T) {
+	s := testServer()
+	s.expiredSessionDrain = 100 * time.Millisecond
+	s.supersededMaxAge = time.Hour
+	s.supersededPoll = 10 * time.Millisecond
+	old, cur := supersededPair(t, s)
+	verified := VerifiedCarrier{ID: "srv-1", ExpiresAt: time.Now().Add(50 * time.Millisecond)}
+
+	go s.awaitCarrierEnd(context.Background(), old.session, verified, old)
+
+	time.Sleep(400 * time.Millisecond) // past expiry plus drain
+	if old.session.IsClosed() {
+		t.Fatal("superseded carrier closed past expiry while a live successor held its host")
+	}
+	_ = cur.session.Close()
+	waitClosed(t, old.session, time.Second, "superseded carrier stayed open after its successor ended")
+}
+
+func TestSupersededHold_MaxAgeClosesCarrier(t *testing.T) {
+	s := testServer()
+	s.expiredSessionDrain = time.Hour
+	s.supersededMaxAge = 100 * time.Millisecond
+	s.supersededPoll = 10 * time.Millisecond
+	old, _ := supersededPair(t, s)
+	verified := VerifiedCarrier{ID: "srv-1", ExpiresAt: time.Now().Add(50 * time.Millisecond)}
+
+	go s.awaitCarrierEnd(context.Background(), old.session, verified, old)
+
+	waitClosed(t, old.session, time.Second, "superseded carrier outlived SupersededStreamMaxAge")
+}
+
+func TestSupersededHold_ClosesWhenLastStreamEnds(t *testing.T) {
+	s := testServer()
+	s.expiredSessionDrain = time.Hour
+	s.supersededMaxAge = time.Hour
+	s.supersededPoll = 10 * time.Millisecond
+	old, _ := supersededPair(t, s)
+	verified := VerifiedCarrier{ID: "srv-1", ExpiresAt: time.Now().Add(50 * time.Millisecond)}
+
+	go s.awaitCarrierEnd(context.Background(), old.session, verified, old)
+
+	time.Sleep(150 * time.Millisecond)
+	old.release()
+	waitClosed(t, old.session, time.Second, "superseded carrier stayed open after its last stream ended")
+}
+
+func TestRegistryHasLiveSuccessor(t *testing.T) {
+	r := newRegistry()
+	old := &carrier{id: "srv-1", session: newStubSession(), drained: make(chan struct{})}
+	r.register(old, []string{"a.example", "b.example"})
+	if r.hasLiveSuccessor(old) {
+		t.Fatal("current carrier reported a successor")
+	}
+
+	other := &carrier{id: "srv-2", session: newStubSession(), drained: make(chan struct{})}
+	if accepted, _ := r.register(other, []string{"a.example"}); len(accepted) != 0 {
+		t.Fatalf("different identity took a live host: %v", accepted)
+	}
+	if r.hasLiveSuccessor(old) {
+		t.Fatal("different identity counted as a successor")
+	}
+
+	cur := &carrier{id: "srv-1", session: newStubSession(), drained: make(chan struct{})}
+	r.register(cur, []string{"b.example"})
+	if !r.hasLiveSuccessor(old) {
+		t.Fatal("live same-identity carrier on a shared host not seen")
+	}
+
+	_ = cur.session.Close()
+	if r.hasLiveSuccessor(old) {
+		t.Fatal("closed successor counted as live")
+	}
+	r.unregister(cur)
+	if r.hasLiveSuccessor(old) {
+		t.Fatal("unregistered successor counted as live")
+	}
+}
+
+// CORE-1382 review: a superseded carrier left in byHost for a hostname its
+// replacement did not claim, or a carrier whose token has expired, is not a
+// successor. Otherwise expired carriers extend each other along a chain.
+func TestRegistryHasLiveSuccessor_IgnoresSupersededAndExpired(t *testing.T) {
+	r := newRegistry()
+	live := time.Now().Add(time.Hour)
+	a := &carrier{id: "srv-1", session: newStubSession(), drained: make(chan struct{}), expiresAt: live}
+	b := &carrier{id: "srv-1", session: newStubSession(), drained: make(chan struct{}), expiresAt: live}
+	c := &carrier{id: "srv-1", session: newStubSession(), drained: make(chan struct{}), expiresAt: live}
+	r.register(a, []string{"a.example", "b.example"})
+	r.register(b, []string{"b.example", "c.example"})
+	if !r.hasLiveSuccessor(a) {
+		t.Fatal("current carrier b not counted as a's successor")
+	}
+	r.register(c, []string{"c.example"})
+	if !b.isDraining() {
+		t.Fatal("b not superseded by c")
+	}
+	if r.hasLiveSuccessor(a) {
+		t.Fatal("superseded carrier b still counted as a's successor")
+	}
+	if !r.hasLiveSuccessor(b) {
+		t.Fatal("current carrier c not counted as b's successor")
+	}
+	c.expiresAt = time.Now().Add(-time.Second)
+	if r.hasLiveSuccessor(b) {
+		t.Fatal("carrier with an expired token counted as a successor")
+	}
+}
+
+// CORE-1382 review: along A{a,b} -> B{b,c} -> C{c}, the expired carrier A must
+// not ride on the superseded B; it gets one ExpiredSessionDrain from expiry.
+func TestSupersededHold_ChainDoesNotExtendRevocation(t *testing.T) {
+	s := testServer()
+	s.expiredSessionDrain = 100 * time.Millisecond
+	s.supersededMaxAge = time.Hour
+	s.supersededPoll = 10 * time.Millisecond
+	s.registry = newRegistry()
+	expiry := time.Now().Add(50 * time.Millisecond)
+	a := &carrier{id: "srv-1", session: newStubSession(), active: 1, drained: make(chan struct{}), expiresAt: expiry}
+	b := &carrier{id: "srv-1", session: newStubSession(), active: 1, drained: make(chan struct{}), expiresAt: expiry}
+	c := &carrier{id: "srv-1", session: newStubSession(), drained: make(chan struct{}), expiresAt: time.Now().Add(time.Hour)}
+	s.registry.register(a, []string{"a.example", "b.example"})
+	s.registry.register(b, []string{"b.example", "c.example"})
+	s.registry.register(c, []string{"c.example"})
+	verified := VerifiedCarrier{ID: "srv-1", ExpiresAt: expiry}
+
+	go s.awaitCarrierEnd(context.Background(), a.session, verified, a)
+	go s.awaitCarrierEnd(context.Background(), b.session, verified, b)
+
+	waitClosed(t, a.session, 600*time.Millisecond, "expired carrier rode on a superseded carrier past one drain")
+	if b.session.IsClosed() {
+		t.Fatal("b closed while its live successor c held its host")
+	}
+	_ = c.session.Close()
+	waitClosed(t, b.session, time.Second, "b stayed open after its successor ended")
+}
+
+// CORE-1382 review: losing the successor just before the max-age deadline
+// does not grant a full ExpiredSessionDrain past that deadline.
+func TestSupersededHold_SuccessorLossNearDeadlineKeepsMaxAge(t *testing.T) {
+	s := testServer()
+	s.expiredSessionDrain = time.Hour
+	s.supersededMaxAge = 300 * time.Millisecond
+	s.supersededPoll = 10 * time.Millisecond
+	old, cur := supersededPair(t, s)
+	start := time.Now()
+	verified := VerifiedCarrier{ID: "srv-1", ExpiresAt: start.Add(50 * time.Millisecond)}
+
+	go s.awaitCarrierEnd(context.Background(), old.session, verified, old)
+
+	time.Sleep(300 * time.Millisecond) // successor lost ~50ms before expiry+maxAge
+	_ = cur.session.Close()
+	waitClosed(t, old.session, time.Second, "successor loss near the deadline bypassed SupersededStreamMaxAge")
+	if elapsed := time.Since(start); elapsed > 700*time.Millisecond {
+		t.Fatalf("closed %v after start; deadline was 350ms", elapsed)
+	}
+}
+
+// CORE-1382 review round 2: a successor lost before expiry still leaves the
+// fallback drain capped at expiry+SupersededStreamMaxAge.
+func TestSupersededHold_SuccessorLostBeforeExpiryKeepsMaxAge(t *testing.T) {
+	s := testServer()
+	s.expiredSessionDrain = time.Hour
+	s.supersededMaxAge = 100 * time.Millisecond
+	s.supersededPoll = 10 * time.Millisecond
+	old, cur := supersededPair(t, s)
+	_ = cur.session.Close()
+	start := time.Now()
+	verified := VerifiedCarrier{ID: "srv-1", ExpiresAt: start.Add(50 * time.Millisecond)}
+
+	go s.awaitCarrierEnd(context.Background(), old.session, verified, old)
+
+	waitClosed(t, old.session, time.Second, "drain outlived SupersededStreamMaxAge with no successor at expiry")
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("closed %v after start; deadline was 150ms", elapsed)
+	}
+}

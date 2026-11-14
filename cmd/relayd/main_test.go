@@ -43,14 +43,19 @@ func TestCertReloadBuildRelayConfigUsesDynamicCertificate(t *testing.T) {
 // silently pinned to the 1024 default.
 func TestBuildRelayConfigHonorsMaxPublicConns(t *testing.T) {
 	cfg := buildRelayConfig(relaydFlags{
-		maxPublicConns:  2048,
-		maxCarrierConns: 64,
+		maxPublicConns:         2048,
+		maxCarrierConns:        512,
+		maxPendingCarrierConns: 96,
+		maxPendingCarrierPerIP: 4,
 	})
 	if cfg.MaxPublicConns != 2048 {
 		t.Fatalf("MaxPublicConns = %d, want 2048 (operator override must be honored)", cfg.MaxPublicConns)
 	}
-	if cfg.MaxCarrierConns != 64 {
-		t.Fatalf("MaxCarrierConns = %d, want 64", cfg.MaxCarrierConns)
+	if cfg.MaxCarrierConns != 512 {
+		t.Fatalf("MaxCarrierConns = %d, want 512", cfg.MaxCarrierConns)
+	}
+	if cfg.MaxPendingCarrierConns != 96 || cfg.MaxPendingCarrierConnsPerSource != 4 {
+		t.Fatalf("pending carrier caps = %d/%d, want 96/4", cfg.MaxPendingCarrierConns, cfg.MaxPendingCarrierConnsPerSource)
 	}
 }
 
@@ -181,6 +186,7 @@ func TestBuildRelayConfigRunLoopFields(t *testing.T) {
 	cfg := buildRelayConfig(relaydFlags{
 		shutdownGrace:            grace,
 		expiredSessionDrain:      expiredDrain,
+		supersededStreamMaxAge:   90 * time.Minute,
 		redactConnectionLogs:     &redactConnectionLogs,
 		rateBytes:                1_000_000,
 		rateBurst:                2_000_000,
@@ -200,6 +206,9 @@ func TestBuildRelayConfigRunLoopFields(t *testing.T) {
 	}
 	if cfg.ExpiredSessionDrain != expiredDrain {
 		t.Errorf("ExpiredSessionDrain = %v, want %v", cfg.ExpiredSessionDrain, expiredDrain)
+	}
+	if cfg.SupersededStreamMaxAge != 90*time.Minute {
+		t.Errorf("SupersededStreamMaxAge = %v, want 90m", cfg.SupersededStreamMaxAge)
 	}
 	if cfg.RedactConnectionLogs == nil || *cfg.RedactConnectionLogs {
 		t.Errorf("RedactConnectionLogs = %v, want explicit false", cfg.RedactConnectionLogs)

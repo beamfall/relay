@@ -33,7 +33,7 @@ func main() {
 		caFile                 = flag.String("relay-ca", os.Getenv("TUNNEL_RELAY_CA"), "relay carrier CA PEM file")
 		insecureTest           = flag.Bool("insecure-skip-verify", false, "skip relay carrier TLS verification for local tests only")
 		transport              = flag.String("transport", config.EnvOrDefault(os.Getenv("TUNNEL_TRANSPORT"), tunnel.TransportTCP), "carrier wire transport: tcp (v1 yamux) or quic (ADR-0018 v2); --relay-addr must point at the matching relay listener")
-		yamuxStreamWindowBytes = flag.Int("yamux-stream-window-bytes", 0, "v1 (tcp transport) carrier per-stream flow-control window in bytes; 0 uses the 1 MiB default. Must match the relay's --yamux-stream-window-bytes. Ignored for quic transport.")
+		yamuxStreamWindowBytes = flag.Int("yamux-stream-window-bytes", 0, "v1 (tcp transport) carrier per-stream flow-control window in bytes; 0 uses the 4 MiB default. Must match the relay's --yamux-stream-window-bytes. Ignored for quic transport.")
 	)
 	flag.Parse()
 
