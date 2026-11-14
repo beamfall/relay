@@ -131,8 +131,8 @@ func TestGateAndReleaseExerciseHermeticBuild(t *testing.T) {
 
 	dockerfile := readRepoFile(t, "Dockerfile")
 	for _, required := range []string{
-		"ARG GO_VERSION=1.26.10",
-		"FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm@sha256:5de7c99eb78ca5e515a4c340235d0955ec5964a5071c492c15503d7c267da473 AS build",
+		"ARG GO_VERSION=1.27.4",
+		"FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS build",
 		"ENV GOTOOLCHAIN=local",
 		"COPY relaytoken ./relaytoken",
 		"RUN go mod download && go mod verify",
