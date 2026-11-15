@@ -15,6 +15,7 @@ import (
 
 	"github.com/beamfall/relay/internal/cache"
 	"github.com/beamfall/relay/internal/config"
+	"github.com/beamfall/relay/internal/protocol"
 	"github.com/beamfall/relay/internal/relay"
 )
 
@@ -125,6 +126,9 @@ func main() {
 	)
 	flag.Parse()
 
+	if err := protocol.ValidateYamuxStreamWindowBytes(int64(*yamuxStreamWindowBytes)); err != nil {
+		log.Fatalf("configure carrier multiplexer: %v", err)
+	}
 	if err := validateTokenMode(*tokenMode, os.Getenv(config.DevModeEnv)); err != nil {
 		log.Fatalf("configure carrier token mode: %v", err)
 	}

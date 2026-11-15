@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/beamfall/relay/internal/config"
+	"github.com/beamfall/relay/internal/protocol"
 	"github.com/beamfall/relay/internal/relay"
 	"github.com/beamfall/relay/internal/tunnel"
 )
@@ -37,6 +38,9 @@ func main() {
 	)
 	flag.Parse()
 
+	if err := validateYamuxStreamWindow(*transport, *yamuxStreamWindowBytes); err != nil {
+		log.Fatalf("configure carrier multiplexer: %v", err)
+	}
 	// Structural guard: --insecure-skip-verify disables carrier TLS verification
 	// and is for local testing only. Refuse it unless developer mode is explicitly
 	// unlocked (BEAMFALL_RELAY_DEV=1), so a copied test invocation or a
@@ -91,6 +95,16 @@ func main() {
 	<-ctx.Done()
 	client.Close()
 	client.Wait()
+}
+
+// validateYamuxStreamWindow checks --yamux-stream-window-bytes only for the tcp
+// transport, the one that builds a yamux session. The flag is documented as ignored
+// for quic, so a stale value there must not stop the client from starting.
+func validateYamuxStreamWindow(transport string, streamWindowBytes int) error {
+	if transport != tunnel.TransportTCP {
+		return nil
+	}
+	return protocol.ValidateYamuxStreamWindowBytes(int64(streamWindowBytes))
 }
 
 func tokenRotationInterval(mode string, ttl time.Duration) time.Duration {
