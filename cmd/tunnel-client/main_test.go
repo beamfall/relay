@@ -17,6 +17,7 @@ import (
 
 	"github.com/beamfall/relay/internal/config"
 	"github.com/beamfall/relay/internal/relay"
+	"github.com/beamfall/relay/internal/tunnel"
 )
 
 // writeCAPEM emits a self-signed CA certificate PEM to a temp file and returns
@@ -209,5 +210,17 @@ func TestTokenExpiryRotationInterval(t *testing.T) {
 	}
 	if got := tokenRotationInterval(tokenModeStatic, time.Second); got != 0 {
 		t.Fatalf("static rotation interval = %v, want disabled", got)
+	}
+}
+
+func TestYamuxStreamWindowValidatedOnlyForTCP(t *testing.T) {
+	if err := validateYamuxStreamWindow(tunnel.TransportTCP, 65536); err == nil {
+		t.Fatal("tcp transport accepted a 64 KiB window below the yamux minimum")
+	}
+	if err := validateYamuxStreamWindow(tunnel.TransportTCP, 0); err != nil {
+		t.Fatalf("tcp transport refused the default window: %v", err)
+	}
+	if err := validateYamuxStreamWindow(tunnel.TransportQUIC, 65536); err != nil {
+		t.Fatalf("quic transport refused an ignored yamux window: %v", err)
 	}
 }

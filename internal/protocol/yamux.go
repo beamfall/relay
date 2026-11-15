@@ -1,7 +1,9 @@
 package protocol
 
 import (
+	"fmt"
 	"io"
+	"math"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -15,6 +17,35 @@ import (
 // 150 ms, against ~10 MB/s and ~3.4 MB/s for the previous 1 MiB (CORE-1386). A stream whose reader stalls can buffer up to one window on the
 // receiving side, so the worst case is the stream count times this value.
 const DefaultYamuxStreamWindowBytes = 4 * 1024 * 1024
+
+// MinYamuxStreamWindowBytes is the smallest per-stream window yamux accepts:
+// its initial stream window, 256 KiB. yamux.VerifyConfig rejects anything
+// smaller, but only when a carrier session starts.
+const MinYamuxStreamWindowBytes = 256 * 1024
+
+// ValidateYamuxStreamWindowBytes checks an operator-supplied
+// --yamux-stream-window-bytes value before any yamux config is built. 0 selects
+// DefaultYamuxStreamWindowBytes. Any other value must lie in
+// [MinYamuxStreamWindowBytes, math.MaxUint32]: yamux stores the window as a
+// uint32, so a larger value would silently wrap (exactly 2^32 becomes a zero
+// window), and a smaller one would pass startup only to fail when the first
+// carrier session is created.
+func ValidateYamuxStreamWindowBytes(streamWindowBytes int64) error {
+	switch {
+	case streamWindowBytes == 0:
+		return nil
+	case streamWindowBytes < 0:
+		return fmt.Errorf("--yamux-stream-window-bytes %d is negative; use 0 for the %d-byte default or a value in [%d, %d]",
+			streamWindowBytes, DefaultYamuxStreamWindowBytes, MinYamuxStreamWindowBytes, uint64(math.MaxUint32))
+	case streamWindowBytes < MinYamuxStreamWindowBytes:
+		return fmt.Errorf("--yamux-stream-window-bytes %d is below the yamux minimum of %d bytes",
+			streamWindowBytes, MinYamuxStreamWindowBytes)
+	case streamWindowBytes > math.MaxUint32:
+		return fmt.Errorf("--yamux-stream-window-bytes %d exceeds the yamux maximum of %d bytes",
+			streamWindowBytes, uint64(math.MaxUint32))
+	}
+	return nil
+}
 
 // YamuxConfig returns the carrier-session multiplexer config shared by the relay
 // (server side) and the tunnel client (client side). Both ends MUST use the same
@@ -36,7 +67,8 @@ const DefaultYamuxStreamWindowBytes = 4 * 1024 * 1024
 //     needs about twice its bandwidth-delay product: 4K remux at 100 Mbps over a
 //     150 ms path needs ~3.75 MiB. streamWindowBytes lets an operator tune this per
 //     deployment (a longer-RTT link needs more headroom, a memory-constrained host
-//     less); <=0 falls back to DefaultYamuxStreamWindowBytes. Each receiver's own
+//     less); <=0 falls back to DefaultYamuxStreamWindowBytes. Callers validate
+//     operator input with ValidateYamuxStreamWindowBytes first. Each receiver's own
 //     setting bounds the direction it receives, so core's window bounds uploads and
 //     the relay's bounds downloads.
 //   - KeepAlive stays enabled (default 30s interval) so a dead carrier is detected and
