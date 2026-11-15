@@ -9,6 +9,12 @@ updates:
       prefix: "ci"
     labels:
       - "dependencies"
+    # Minor and patch bumps land as one PR; each major stays its own PR.
+    groups:
+      gomod-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -19,3 +25,9 @@ updates:
       prefix: "ci"
     labels:
       - "dependencies"
+    # Minor and patch bumps land as one PR; each major stays its own PR.
+    groups:
+      github-actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"

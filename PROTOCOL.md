@@ -468,7 +468,7 @@ preserved:
 
 ADR-0103 scopes the Self-hosted Relay OUT (the operator runs the infra), so this repo is not the
 enforcement point today. When the Hosted Relay (ADR-0025) is built on this code, expand
-RV-RELAY-010 in `docs/agent-memory/tests.md` to cover all four ADR-0103 obligations:
+test obligation RV-RELAY-010 to cover all four ADR-0103 obligations:
 (a) no per-stream/per-hostname/per-account labels on `/metrics`;
 (b) no durable per-connection record;
 (c) transient log retention is bounded (days, not months) per ADR-0103 §2 — the operator's

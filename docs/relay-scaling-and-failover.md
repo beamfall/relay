@@ -90,7 +90,7 @@ Two layers, taken in order of blast radius:
 
 ## Open items (tracked elsewhere)
 
-- Durable shared fair-use accounting for multi-instance (ADR-0025; `docs/agent-memory/ideas.md`).
+- Durable shared fair-use accounting for multi-instance (ADR-0025; tracked as a follow-up idea).
 - Shared/persistent nonce store for the hosted verifier (RV-RELAY-007; `internal/relay/hosted_token.go`).
 - These are prerequisites for fanning a single carrier across instances; single-carrier-per-instance
   (sticky ingress) needs neither and is the recommended launch posture.
