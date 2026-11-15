@@ -17,11 +17,12 @@ import subprocess
 import sys
 
 PATTERNS = [
-    ("private-repo", re.compile(r"\b(?:core|apple|plugins|relay)-private\b")),
+    ("private-repo", re.compile(
+        r"\b(?:core|apple|apple-ui|android|web|windows|linux|plugins|relay)-private\b")),
     ("agent-memory", re.compile(r"agent-memory/")),
     ("workspace-root", re.compile(r"\bbeamfall-workspace\b")),
     ("handoff-note", re.compile(r"\bHANDOFF-")),
-    ("private-tree", re.compile(r"\bdocs/(?:plans|adr|release/evidence)/")),
+    ("private-tree", re.compile(r"(?:\bdocs|\.\.)/(?:plans|adr|release/evidence)/")),
     # An evidence file named by ticket ID or timestamp, at any depth, not an
     # output dir; TICKET-<X>-repair-r* is the repair-path test's placeholder.
     ("evidence-file", re.compile(r"\.agent-evidence/(?:[\w.-]*/)*(?!TICKET-[A-Z]-repair-r)[A-Z0-9]")),
@@ -37,7 +38,7 @@ EXEMPT = re.compile(
 )
 
 PREFILTER = (r"-private|agent-memory/|beamfall-workspace|HANDOFF-"
-             r"|docs/(plans|adr|release/evidence)/|\.agent-evidence/")
+             r"|(docs|\.\.)/(plans|adr|release/evidence)/|\.agent-evidence/")
 
 
 def main(argv):
