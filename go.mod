@@ -7,8 +7,8 @@ require (
 	github.com/beamfall/relay/relaytoken v0.0.0
 	github.com/hashicorp/yamux v0.1.2
 	github.com/prometheus/client_golang v1.25.0
-	github.com/quic-go/quic-go v0.60.0
-	github.com/redis/go-redis/v9 v9.21.0
+	github.com/quic-go/quic-go v0.65.0
+	github.com/redis/go-redis/v9 v9.23.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
 	go.opentelemetry.io/otel/trace v1.47.0
@@ -29,7 +29,7 @@ require (
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/metric v1.47.0 // indirect
-	go.uber.org/atomic v1.11.0 // indirect
+	go.uber.org/atomic v1.12.0 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/net v0.59.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
