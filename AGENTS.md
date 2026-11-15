@@ -5,8 +5,8 @@
 
 > **Documentation:** before adding, moving, or archiving any doc, follow the workspace
 > [documentation governance](../DOCUMENTATION-GOVERNANCE.md) (doc map: [`../DOCS.md`](../DOCS.md)).
-> The only active work source is `beamfall/docs/plans/roadmap.md`; handoffs, artifacts, and
-> agent-memory files are reference only.
+> The only active work source is the core ticket queue; handoffs, artifacts, and agent notes are
+> reference only.
 
 ## Testing contract (ADR-0121 §8)
 

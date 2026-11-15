@@ -13,7 +13,7 @@ path whose presented server key does not match the LAN-captured SPKI pin.
 - Required behavior: the selected relay URL still builds a pinned session using the original
   LAN-captured SPKI hash, not a relay-presented replacement hash.
 - Required archive: write the release attempt, command output, commit SHA, and reviewer sign-off to
-  `docs/plans/roadmap/evidence/NGAUDIT-D5-pinning-gate.md` in the launch evidence bundle.
+  the NGAUDIT-D5 pinning-gate record in the launch evidence bundle.
 
 ## Cut the `v0.1.0` Relay Image
 
@@ -25,7 +25,7 @@ Use a clean canonical `main` checkout and the workspace receipt tooling:
 
 ```sh
 export RELAY_ROOT=/absolute/path/to/beamfall-relay
-export WORKSPACE_ROOT=/absolute/path/to/beamfall-workspace
+export WORKSPACE_ROOT=/absolute/path/to/workspace
 cd "$RELAY_ROOT"
 git switch main
 git pull --ff-only origin main

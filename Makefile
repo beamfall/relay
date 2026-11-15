@@ -6,9 +6,9 @@ GOENV := GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE) GOLANGCI_LINT_CACHE=$(GOLAN
 # Coverage floor (ADR-0121 §4). Baseline measured at 73%; floor set at 70%.
 COVERAGE_FLOOR ?= 70
 
-.PHONY: gate relaytoken-check hermetic-check release-image build vet test cover lint vuln gofmt-check soak gen-vectors verify-vectors fuzz makefile-cache-isolation
+.PHONY: gate private-pointer-scan relaytoken-check hermetic-check release-image build vet test cover lint vuln gofmt-check soak gen-vectors verify-vectors fuzz makefile-cache-isolation
 
-gate: gofmt-check build vet relaytoken-check hermetic-check makefile-cache-isolation lint vuln cover verify-vectors fuzz release-image
+gate: gofmt-check private-pointer-scan build vet relaytoken-check hermetic-check makefile-cache-isolation lint vuln cover verify-vectors fuzz release-image
 
 relaytoken-check:
 	cd relaytoken && $(GOENV) GOTOOLCHAIN=local GOPROXY=off GOVCS='*:off' GOENV=off go vet ./...
@@ -70,6 +70,11 @@ lint:
 
 makefile-cache-isolation:
 	sh script/makefile-cache-isolation_test.sh
+
+# CORE-1516: this public tree must not cite private paths (agent-memory notes,
+# untracked evidence files, private sibling repos).
+private-pointer-scan:
+	python3 script/private-pointer-scan.py
 
 # vuln: pin govulncheck to an explicit release rather than `@latest` so the
 # CI toolchain is reproducible and can't fetch-and-execute a newer build

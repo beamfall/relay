@@ -39,7 +39,7 @@ Per **ADR-0025**, the launch promise is the **user-run self-hosted relay**: an o
 `relayd` on their own VPS and runs `tunnel-client` next to their home server. Self-hosted
 ships first, and RELAY-1 readiness is scoped to the hosted token verifier/client boundary
 described below. The SniTun-style relay contract and hosted internals are specified in
-**ADR-0018**. Both ADRs live in the [Core ADR index](../beamfall/docs/adr/README.md), not in this repo.
+**ADR-0018**. Both ADRs are maintained with Core's decision records, not in this repo.
 
 RELAY-1 has implemented only the hosted token-boundary seam: `relayd` can consume a
 cloud-minted short-lived tunnel token through `TokenVerifier`, and `tunnel-client` can

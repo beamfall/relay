@@ -25,9 +25,9 @@ The canonical CGNAT path is therefore:
   `TestAdvertisedEndpointsAreConnectableWithAdvertisedScheme` proves the advertised direct,
   overlay, and self-hosted-relay endpoints all handshake with the advertised scheme; direct FQDN SNI
   serves the ACME cert, while overlay and self-hosted relay serve the LAN-enrolled self-signed SPKI.
-- `beamfall/docs/adr/0046-client-cert-pinning.md` section 7 records the accepted amendment:
+- ADR-0046 (client cert pinning) section 7 records the accepted amendment:
   self-signed baseline identity for every server, pinned by native clients.
-- `beamfall/docs/adr/0118-guarded-static-carrier-cert-for-relay-e2e.md` records that the old
+- ADR-0118 (guarded static carrier cert for relay E2E) records that the old
   "no cert => carrier off" premise is superseded; the carrier terminates against the server's own
   pinned identity.
 
