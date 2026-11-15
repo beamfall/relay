@@ -110,7 +110,7 @@ func TestBuildWorkflowsNeedNoCloudCredential(t *testing.T) {
 func TestGateAndReleaseExerciseHermeticBuild(t *testing.T) {
 	makefile := readRepoFile(t, "Makefile")
 	for _, required := range []string{
-		"gate: gofmt-check build vet relaytoken-check hermetic-check ",
+		"gate: gofmt-check private-pointer-scan build vet relaytoken-check hermetic-check ",
 		"GOTOOLCHAIN=local GOPROXY=off GOVCS='*:off' GOENV=off",
 		"hermetic-check requires a clean committed tree",
 		"clean_go off go build ./...",
