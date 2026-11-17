@@ -26,6 +26,9 @@ type remapListener struct {
 	net.Listener
 	attackerMode atomic.Bool
 	accepted     atomic.Int64
+	// attackerSources spreads attacker connections over this many source
+	// addresses, in rotation; zero means the single attackerSource.
+	attackerSources atomic.Int64
 }
 
 func (l *remapListener) Accept() (net.Conn, error) {
@@ -34,15 +37,19 @@ func (l *remapListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	isAttacker := l.attackerMode.Load()
-	l.accepted.Add(1)
+	n := l.accepted.Add(1)
 	if !isAttacker {
 		return conn, nil
+	}
+	source := net.ParseIP(attackerSource)
+	if sources := l.attackerSources.Load(); sources > 0 {
+		source = net.IPv4(198, 51, 100, byte(1+n%sources))
 	}
 	port := 0
 	if remote, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
 		port = remote.Port
 	}
-	return remappedConn{Conn: conn, remote: &net.TCPAddr{IP: net.ParseIP(attackerSource), Port: port}}, nil
+	return remappedConn{Conn: conn, remote: &net.TCPAddr{IP: source, Port: port}}, nil
 }
 
 type remappedConn struct {
@@ -54,6 +61,15 @@ func (c remappedConn) RemoteAddr() net.Addr { return c.remote }
 
 func startPreAuthTestRelay(t *testing.T, ctx context.Context, cfg Config) (*Server, *remapListener) {
 	t.Helper()
+	return startPreAuthTestRelayWithVerifier(t, ctx, cfg, StaticTokenVerifier{
+		Token:     []byte("the-real-token"),
+		CarrierID: "carrier-1",
+		Hostnames: []string{"home.relay.test"},
+	})
+}
+
+func startPreAuthTestRelayWithVerifier(t *testing.T, ctx context.Context, cfg Config, verifier TokenVerifier) (*Server, *remapListener) {
+	t.Helper()
 	var remap *remapListener
 	cfg.PublicAddr = "127.0.0.1:0"
 	cfg.CarrierAddr = "127.0.0.1:0"
@@ -61,11 +77,7 @@ func startPreAuthTestRelay(t *testing.T, ctx context.Context, cfg Config) (*Serv
 		Certificates: []tls.Certificate{backoffTestCert(t)},
 		MinVersion:   tls.VersionTLS13,
 	}
-	cfg.TokenVerifier = StaticTokenVerifier{
-		Token:     []byte("the-real-token"),
-		CarrierID: "carrier-1",
-		Hostnames: []string{"home.relay.test"},
-	}
+	cfg.TokenVerifier = verifier
 	cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg.listenCarrier = func(network, address string) (net.Listener, error) {
 		ln, err := net.Listen(network, address)
@@ -216,5 +228,108 @@ func waitFor(t *testing.T, cond func() bool, what string) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestIdleConnectionsFromManySourcesCannotBlockValidCarrier (CORE-2253): at the
+// default caps, idle connections from eight sources used to hold every pending
+// admission for the whole handshake timeout, so no carrier could register. A
+// full pending budget now evicts the oldest connection of the source holding
+// the most, so a valid carrier registers at once.
+func TestIdleConnectionsFromManySourcesCannotBlockValidCarrier(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s, remap := startPreAuthTestRelay(t, ctx, Config{CarrierHandshakeTimeout: 30 * time.Second})
+	remap.attackerSources.Store(DefaultMaxPendingCarrierConns / DefaultMaxPendingCarrierConnsPerSource)
+	dialIdleAttackers(t, remap, DefaultMaxPendingCarrierConns)
+	if held := len(s.carrierAdmissions); held != DefaultMaxPendingCarrierConns {
+		t.Fatalf("pending admissions held = %d, want the full budget %d", held, DefaultMaxPendingCarrierConns)
+	}
+
+	for i := 0; i < 3; i++ {
+		frame, err := handshakeValidCarrier(t, s.CarrierAddr())
+		if err != nil {
+			t.Fatalf("valid carrier %d failed while eight sources held every pending admission: %v", i, err)
+		}
+		if frame.Type != protocol.FrameAck {
+			t.Fatalf("valid carrier %d reply = %+v, want ack", i, frame)
+		}
+	}
+	if evicted := s.metrics.carrierPendingEvicted.Load(); evicted == 0 {
+		t.Fatal("no pending connection was evicted to admit the valid carrier")
+	}
+}
+
+// TestPendingEvictionTakesFromTheHeaviestSource (CORE-2253): eviction closes
+// the oldest pending connection of the source holding the most, so a source
+// with one pending connection is not the one that loses it.
+func TestPendingEvictionTakesFromTheHeaviestSource(t *testing.T) {
+	s := &Server{
+		carrierAdmissions:   make(chan struct{}, 3),
+		carrierPendingPerIP: newPerIPLimiter(2),
+	}
+	var evicted []string
+	admit := func(ip, name string) {
+		t.Helper()
+		if _, ok := s.admitPendingCarrier(&net.TCPAddr{IP: net.ParseIP(ip)}, func() { evicted = append(evicted, name) }); !ok {
+			t.Fatalf("admit %s refused", name)
+		}
+	}
+	admit("192.0.2.1", "light")
+	admit("192.0.2.2", "heavy-old")
+	admit("192.0.2.2", "heavy-new")
+	admit("192.0.2.3", "newcomer")
+	if len(evicted) != 1 || evicted[0] != "heavy-old" {
+		t.Fatalf("evicted = %v, want [heavy-old]", evicted)
+	}
+	if held := len(s.carrierAdmissions); held != 3 {
+		t.Fatalf("pending admissions held = %d, want 3", held)
+	}
+	if _, ok := s.admitPendingCarrier(&net.TCPAddr{IP: net.ParseIP("192.0.2.3")}, nil); !ok {
+		t.Fatal("second connection from the newcomer refused below its per-source cap")
+	}
+	if _, ok := s.admitPendingCarrier(&net.TCPAddr{IP: net.ParseIP("192.0.2.3")}, nil); ok {
+		t.Fatal("a source at its per-source cap was admitted")
+	}
+}
+
+// panicOnceVerifier panics on the first token it is asked to verify and
+// verifies normally afterwards.
+type panicOnceVerifier struct {
+	StaticTokenVerifier
+	panicked atomic.Bool
+}
+
+func (v *panicOnceVerifier) VerifyCarrierToken(ctx context.Context, token []byte, hostnames []string, surface string) (VerifiedCarrier, error) {
+	if v.panicked.CompareAndSwap(false, true) {
+		panic("injected verifier panic")
+	}
+	return v.StaticTokenVerifier.VerifyCarrierToken(ctx, token, hostnames, surface)
+}
+
+// TestPanicInCarrierHandlerDoesNotStopTheRelay (CORE-2254): a panic in one
+// connection's goroutine is recovered and counted, its pending admission is
+// released, and the relay keeps serving.
+func TestPanicInCarrierHandlerDoesNotStopTheRelay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	verifier := &panicOnceVerifier{StaticTokenVerifier: StaticTokenVerifier{
+		Token:     []byte("the-real-token"),
+		CarrierID: "carrier-1",
+		Hostnames: []string{"home.relay.test"},
+	}}
+	s, _ := startPreAuthTestRelayWithVerifier(t, ctx, Config{}, verifier)
+
+	if frame, err := handshakeValidCarrier(t, s.CarrierAddr()); err == nil && frame.Type == protocol.FrameAck {
+		t.Fatalf("first carrier got an ack; the injected panic did not fire")
+	}
+	waitFor(t, func() bool { return s.metrics.connPanics.Load() == 1 && len(s.carrierAdmissions) == 0 },
+		"the panic to be counted and its pending admission released")
+
+	frame, err := handshakeValidCarrier(t, s.CarrierAddr())
+	if err != nil || frame.Type != protocol.FrameAck {
+		t.Fatalf("carrier after a recovered panic = %+v, %v; want ack", frame, err)
 	}
 }

@@ -29,7 +29,7 @@ MemoryMax=512M
 # Each accepted public or carrier TCP connection holds one file descriptor for the life of the
 # connection (yamux multiplexes a carrier's streams over its single socket, so streams do not add
 # further fds); the listener sockets, HMAC nonce store, and fair-use outbox add a handful more. The
-# default --max-public-conns (1024) plus --max-carrier-conns (64) already approach a typical distro
+# default --max-public-conns (1024) plus --max-carrier-conns (256) already approach a typical distro
 # default of 1024 open files, so this raises the ceiling well above the shipped connection caps.
 LimitNOFILE=65536
 # Journald retains this unit's logs indefinitely by default, which contradicts the published

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,6 +55,10 @@ const (
 	// DefaultMaxPendingCarrierConnsPerSource is the default cap on
 	// unauthenticated carrier connections from one IPv4 /32 or IPv6 /64.
 	DefaultMaxPendingCarrierConnsPerSource = 8
+	// DefaultCarrierHandshakeTimeout is how long an unauthenticated carrier
+	// connection may take to send its hello. A carrier sends it as soon as it
+	// connects, so a few seconds covers a slow link.
+	DefaultCarrierHandshakeTimeout = 5 * time.Second
 )
 
 type Config struct {
@@ -188,9 +193,12 @@ type Server struct {
 	metrics                metrics
 	acceptRetries          atomic.Int64
 	readiness              *relayReadinessState
-	publicSlots            chan struct{}         // semaphore bounding concurrent public conns
-	carrierAdmissions      chan struct{}         // semaphore bounding unauthenticated (pending) carrier conns
-	carrierPendingPerIP    *perIPLimiter         // bounds pending carrier conns per IPv4 /32 or IPv6 /64
+	publicSlots            chan struct{} // semaphore bounding concurrent public conns
+	carrierAdmissions      chan struct{} // semaphore bounding unauthenticated (pending) carrier conns
+	carrierPendingPerIP    *perIPLimiter // bounds pending carrier conns per IPv4 /32 or IPv6 /64
+	pendingMu              sync.Mutex    // guards pendingCarriers and pendingSeq
+	pendingCarriers        map[*pendingCarrier]struct{}
+	pendingSeq             uint64
 	carrierSlots           chan struct{}         // semaphore bounding authenticated carrier sessions
 	publicPerIP            *perIPLimiter         // bounds public conns per IPv4 /32 or IPv6 /64
 	publicPerCarrier       *sourceCarrierLimiter // bounds streams per source prefix and carrier
@@ -295,7 +303,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		cfg.MaxPendingCarrierConnsPerSource = DefaultMaxPendingCarrierConnsPerSource
 	}
 	if cfg.CarrierHandshakeTimeout <= 0 {
-		cfg.CarrierHandshakeTimeout = 10 * time.Second
+		cfg.CarrierHandshakeTimeout = DefaultCarrierHandshakeTimeout
 	}
 	if cfg.ShutdownGrace < 0 {
 		cfg.ShutdownGrace = 0
@@ -615,6 +623,7 @@ func (s *Server) acceptPublic(ctx context.Context) {
 			defer s.wg.Done()
 			defer func() { <-s.publicSlots }()
 			defer s.publicPerIP.release(ip)
+			defer s.recoverConnPanic("public")
 			s.handlePublicConn(ctx, conn)
 		}()
 	}
@@ -644,19 +653,26 @@ func (s *Server) acceptCarriers(ctx context.Context) {
 		// total and per source, so neither a flood nor one source can pile up
 		// goroutines and file descriptors or hold every pending admission
 		// (CORE-1385).
-		endPending, ok := s.admitPendingCarrier(conn.RemoteAddr())
+		pendingCtx, stopPending := context.WithCancel(ctx)
+		endPending, ok := s.admitPendingCarrier(conn.RemoteAddr(), func() {
+			stopPending()
+			_ = conn.Close()
+		})
 		if !ok {
+			stopPending()
 			_ = conn.Close()
 			continue
 		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer stopPending()
 			defer endPending()
+			defer s.recoverConnPanic("carrier")
 			// Back off a repeat-offender source before its handshake. The sleep
 			// holds only a pending admission, never a carrier slot
-			// (SECREV-RELAY-8).
-			s.handshakeThrottle.backoffBefore(ctx, conn.RemoteAddr())
+			// (SECREV-RELAY-8), and ends early if the admission is evicted.
+			s.handshakeThrottle.backoffBefore(pendingCtx, conn.RemoteAddr())
 			s.handleCarrierConn(ctx, conn, endPending)
 		}()
 	}
@@ -665,7 +681,14 @@ func (s *Server) acceptCarriers(ctx context.Context) {
 // admitPendingCarrier reserves a pending (unauthenticated) admission for a new
 // carrier connection from remote, capped in total and per source. It returns
 // an idempotent release, run once the handshake is decided.
-func (s *Server) admitPendingCarrier(remote net.Addr) (func(), bool) {
+//
+// A source at its own cap is refused. When the total is full the new
+// connection is admitted and an older pending one is evicted: the oldest
+// connection of the source that holds the most (CORE-2253). A valid carrier
+// handshakes in milliseconds and holds one admission, so idle connections
+// spread over several sources cannot keep it out. evict closes the connection
+// if it is later chosen for eviction.
+func (s *Server) admitPendingCarrier(remote net.Addr, evict func()) (func(), bool) {
 	source := sourcePrefix(remote)
 	if !s.carrierPendingPerIP.acquire(source) {
 		s.metrics.carrierPendingPerSourceOverCap.Add(1)
@@ -674,14 +697,88 @@ func (s *Server) admitPendingCarrier(remote net.Addr) (func(), bool) {
 	select {
 	case s.carrierAdmissions <- struct{}{}:
 	default:
-		s.carrierPendingPerIP.release(source)
-		s.metrics.carrierOverCap.Add(1)
-		return nil, false
+		if !s.evictPendingCarrier() {
+			s.carrierPendingPerIP.release(source)
+			s.metrics.carrierOverCap.Add(1)
+			return nil, false
+		}
+		select {
+		case s.carrierAdmissions <- struct{}{}:
+		default:
+			s.carrierPendingPerIP.release(source)
+			s.metrics.carrierOverCap.Add(1)
+			return nil, false
+		}
 	}
-	return sync.OnceFunc(func() {
+	entry := &pendingCarrier{source: source, evict: evict}
+	entry.release = sync.OnceFunc(func() {
+		s.pendingMu.Lock()
+		delete(s.pendingCarriers, entry)
+		s.pendingMu.Unlock()
 		<-s.carrierAdmissions
 		s.carrierPendingPerIP.release(source)
-	}), true
+	})
+	s.pendingMu.Lock()
+	s.pendingSeq++
+	entry.seq = s.pendingSeq
+	if s.pendingCarriers == nil {
+		s.pendingCarriers = make(map[*pendingCarrier]struct{})
+	}
+	s.pendingCarriers[entry] = struct{}{}
+	s.pendingMu.Unlock()
+	return entry.release, true
+}
+
+// pendingCarrier is one unauthenticated carrier connection holding a pending
+// admission.
+type pendingCarrier struct {
+	source  string
+	seq     uint64
+	evict   func()
+	release func()
+}
+
+// evictPendingCarrier frees one pending admission by closing the oldest
+// pending connection of the source that holds the most, and reports whether it
+// freed one. Only the accept loops call it.
+func (s *Server) evictPendingCarrier() bool {
+	s.pendingMu.Lock()
+	perSource := make(map[string]int, len(s.pendingCarriers))
+	for entry := range s.pendingCarriers {
+		perSource[entry.source]++
+	}
+	var victim *pendingCarrier
+	for entry := range s.pendingCarriers {
+		if victim == nil ||
+			perSource[entry.source] > perSource[victim.source] ||
+			(perSource[entry.source] == perSource[victim.source] && entry.seq < victim.seq) {
+			victim = entry
+		}
+	}
+	s.pendingMu.Unlock()
+	if victim == nil {
+		return false
+	}
+	s.metrics.carrierPendingEvicted.Add(1)
+	victim.release()
+	if victim.evict != nil {
+		victim.evict()
+	}
+	return true
+}
+
+// recoverConnPanic stops a panic in one connection's goroutine from taking
+// relayd, and every home it serves, down with it (CORE-2254). It counts the
+// panic and logs its value and stack, which carry code locations and no
+// connection payload. The handler's own deferred Close has already closed the
+// connection. Call it deferred.
+func (s *Server) recoverConnPanic(listener string) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	s.metrics.connPanics.Add(1)
+	s.logger.Error("connection handler panicked; connection closed", "listener", listener, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 }
 
 // reserveCarrierSlot takes an authenticated-carrier slot, held for the
@@ -746,18 +843,25 @@ func (s *Server) acceptQUICCarriers(ctx context.Context) {
 		retryDelay = 0
 		// Share the TCP pending budgets so neither transport can build an
 		// unbounded queue of unauthenticated goroutines or connections.
-		endPending, ok := s.admitPendingCarrier(conn.RemoteAddr())
+		pendingCtx, stopPending := context.WithCancel(ctx)
+		endPending, ok := s.admitPendingCarrier(conn.RemoteAddr(), func() {
+			stopPending()
+			_ = conn.CloseWithError(0, "carrier admission evicted")
+		})
 		if !ok {
+			stopPending()
 			_ = conn.CloseWithError(0, "carrier admission over cap")
 			continue
 		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer stopPending()
 			defer endPending()
+			defer s.recoverConnPanic("quic_carrier")
 			// Back off a repeat-offender source before its handshake, holding no
 			// carrier slot (SECREV-RELAY-8). Mirrors acceptCarriers.
-			s.handshakeThrottle.backoffBefore(ctx, conn.RemoteAddr())
+			s.handshakeThrottle.backoffBefore(pendingCtx, conn.RemoteAddr())
 			s.handleQUICCarrierConn(ctx, conn, endPending)
 		}()
 	}

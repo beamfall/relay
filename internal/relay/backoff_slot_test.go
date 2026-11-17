@@ -113,8 +113,9 @@ func TestCarrierBackoffDoesNotOccupyCarrierSlot(t *testing.T) {
 // TestCarrierBackoffAdmissionCapBoundsPreSlotHandlers proves a throttled-source
 // flood cannot accumulate connections and goroutines while the handlers sleep
 // before reserving carrier slots. With a one-entry admission budget, the first
-// connection parks in backoff and the next accepted connection is closed
-// promptly, while the carrier slot remains free (SECREV-RELAY-8).
+// connection parks in backoff and the next accepted connection takes its
+// admission, closing it promptly, while the carrier slot remains free
+// (SECREV-RELAY-8, CORE-2253).
 func TestCarrierBackoffAdmissionCapBoundsPreSlotHandlers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -156,19 +157,21 @@ func TestCarrierBackoffAdmissionCapBoundsPreSlotHandlers(t *testing.T) {
 		t.Fatalf("carrier slots = %d during backoff, want 0", occupied)
 	}
 
+	// A connection over the pending cap takes the admission of the oldest
+	// pending one, which is closed (CORE-2253); the count stays at the cap.
 	second, err := net.Dial("tcp", s.carrierListener.Addr().String())
 	if err != nil {
 		t.Fatalf("dial over-cap carrier: %v", err)
 	}
 	defer second.Close() //nolint:errcheck // test connection cleanup.
-	if err := second.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("set over-cap read deadline: %v", err)
+	if err := first.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set evicted read deadline: %v", err)
 	}
 	var b [1]byte
-	if _, err := second.Read(b[:]); err == nil {
-		t.Fatal("over-cap carrier connection remained open")
+	if _, err := first.Read(b[:]); err == nil {
+		t.Fatal("evicted carrier connection remained open")
 	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
-		t.Fatalf("over-cap carrier connection was not closed promptly: %v", err)
+		t.Fatalf("evicted carrier connection was not closed promptly: %v", err)
 	}
 
 	if admitted := len(s.carrierAdmissions); admitted != 1 {

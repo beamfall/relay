@@ -157,6 +157,8 @@ type metrics struct {
 	publicPerIPOverCap             atomic.Int64
 	carrierOverCap                 atomic.Int64
 	carrierPendingPerSourceOverCap atomic.Int64
+	carrierPendingEvicted          atomic.Int64
+	connPanics                     atomic.Int64
 	fairUse                        *fairUseLimiter
 	carrierReadiness               carrierReadiness
 	// nonceCache is set (relay.go Start) only when the configured
@@ -348,6 +350,12 @@ func (m *metrics) newMetricsRegistry() *prometheus.Registry {
 	counter("beamfall_relay_carrier_pending_per_source_over_cap_total",
 		"Unauthenticated carrier connections rejected for exceeding the per-source pending cap.",
 		m.carrierPendingPerSourceOverCap.Load)
+	counter("beamfall_relay_carrier_pending_evicted_total",
+		"Unauthenticated carrier connections closed to admit a newer one when the pending cap was full.",
+		m.carrierPendingEvicted.Load)
+	counter("beamfall_relay_connection_panics_total",
+		"Panics recovered in a connection handler; the connection was closed and the relay kept serving.",
+		m.connPanics.Load)
 	counter("beamfall_relay_fairuse_refused_connections_total",
 		"New connections refused because a tunnel was over its hard fair-use limit.",
 		m.fairUseRefusals.Load)
