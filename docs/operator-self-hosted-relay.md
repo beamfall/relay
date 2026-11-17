@@ -106,6 +106,11 @@ pin through the relay**, not ACME-through-relay issuance:
    register the same hostname in `RELAYD_HOSTNAMES` and the home server's relay config.
 3. Run `relayd` on the public host and the Core relay carrier/tunnel client next to the home server.
    The home server makes the only inbound-blocked-side connection: an outbound carrier to the relay.
+   On the TLS/TCP carrier, the relay and a home server on Linux or macOS each hold the carrier
+   socket's unsent send backlog to 16 KiB, so playback sync and other small streams do not wait
+   behind queued media. **A home server on Windows is not bounded** (CORE-2291): under a saturating
+   media stream its control traffic can lag by several hundred milliseconds. See
+   `docs/relay-latency-budget.md`.
 4. Remote native clients connect to `https://home.relay.example`; the relay routes by SNI and stays
    byte-blind, while Core terminates TLS with the already-pinned self-signed identity.
 

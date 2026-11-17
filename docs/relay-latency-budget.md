@@ -56,9 +56,13 @@ millisecond). Neither limits bytes in flight, so throughput is about the same (s
 Limits of what ships:
 
 - The relay bounds its own carrier sockets, and so does this repository's tunnel client. **Core's
-  home server uses its own tunnel client**, which sends the media, and it does not have the bound
-  yet. Until it does, only the relay-to-home direction is bounded in production.
-- Windows has no bound.
+  home server uses its own tunnel client**, which sends the media. It has the same bound on Linux
+  and macOS from CORE-2282 (measured below); a home server older than that is bounded only in the
+  relay-to-home direction.
+- **Windows has no bound**, in the relay or in core's tunnel client: Windows has no
+  `TCP_NOTSENT_LOWAT`. A home server on Windows using the TLS/TCP carrier still queues accepted
+  media ahead of control streams. It has not been measured there; the Linux "before" rows are the
+  nearest indication. CORE-2291 tracks it.
 
 ## Measurements
 
@@ -84,6 +88,44 @@ loopback MTU 1500 with segmentation offload off. Loss here is real packet loss f
 
 Two runs with a 4 KiB bound and 1% loss gave a TCP p99 of 349.9 and 327.8 ms, no better than
 16 KiB. This is one host and a virtualised kernel; treat the figures as indicative.
+
+### Linux, real `tc`/netem link, core's tunnel client as the carrier
+
+The same link and host, with core's home server tunnel client (`internal/remoteaccess` at core
+`ed8d56e5`, CORE-2282) registering as the carrier and sending the media, in place of this
+repository's client. "Before" is core's client dialled without the bound. 4000 control messages
+per run, all echoed.
+
+| Carrier client | Loss | | p50 | p99 | p99.9 | max | Media moved (both ways) |
+|---|---|---|---|---|---|---|---|
+| core | 0% | before | 392.1 | 547.8 | 573.0 | 583.3 | 35.2 Mbit/s |
+| core | 0% | bounded | 116.4 | 156.1 | 164.5 | 169.2 | 35.7 Mbit/s |
+| core | 0% | bounded | 117.5 | 154.7 | 163.8 | 166.2 | 35.6 Mbit/s |
+| core | 0% | bounded | 118.9 | 157.0 | 164.5 | 177.5 | 36.0 Mbit/s |
+| core | 1% | before | 515.8 | 1051.7 | 1120.9 | 1126.2 | 13.6 Mbit/s |
+| core | 1% | bounded | 164.2 | **329.5** | 373.3 | 387.6 | 14.5 Mbit/s |
+| this repository | 0% | bounded | 116.0 | 153.3 | 160.8 | 164.7 | 34.9 Mbit/s |
+
+Core's client is inside the budget without loss and matches this repository's client run in the
+same session. With real 1% loss it is over the budget by the same margin as above, for the same
+reason. The 1% rows are single runs.
+
+To repeat it, build core's test binary and pass it as the carrier:
+
+```sh
+# in a core checkout
+CGO_ENABLED=0 go test -c -o /tmp/remoteaccess.test ./internal/remoteaccess/
+# in this repository
+go build -o /tmp/relay-loadgen ./cmd/relay-loadgen
+sudo BIN=/tmp/relay-loadgen DURATION=20s \
+  CARRIER_CMD='/tmp/remoteaccess.test -test.run TestCarryForRelayLatencyHarness' \
+  script/netem-latency.sh
+```
+
+With `CARRIER_CMD` set, the loadgen runs with `-external-carrier-dir`: it starts the relay with a
+one-run HMAC secret, writes that secret (`relay-token`), the carrier CA (`relay-ca.pem`) and the
+addresses (`carrier.env`) into a scratch directory, and waits up to 60 s for the outside carrier
+to register before measuring. `CARRIER_UNBOUNDED=1` in the environment gives the "before" rows.
 
 ### Linux, in-process link
 

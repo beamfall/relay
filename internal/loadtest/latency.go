@@ -9,12 +9,16 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
 	"math/big"
 	"net"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -47,6 +51,11 @@ type LatencyOptions struct {
 	// CarrierPort fixes the relay's carrier port, TCP and UDP, so an outside
 	// shaper can match it. Zero picks free ports.
 	CarrierPort int
+	// ExternalCarrierDir, when set, leaves this repository's tunnel client out:
+	// the run waits for an outside tunnel client (core's) to register as the
+	// home's carrier, and writes what that client needs into the directory. See
+	// writeExternalCarrierFiles. Transport must be tunnel.TransportTCP.
+	ExternalCarrierDir string
 }
 
 // LatencyResult is the control stream's round-trip latency through the relay:
@@ -84,7 +93,73 @@ const (
 	streamKindEcho   = 'c'
 	streamKindMedia  = 'm'
 	carrierReadyWait = 10 * time.Second
+	// externalCarrierReadyWait is longer: the outside tunnel client is a
+	// separate process that starts after the files appear.
+	externalCarrierReadyWait = 60 * time.Second
 )
+
+// Files written into LatencyOptions.ExternalCarrierDir.
+const (
+	// ExternalCarrierSecretFile is the shared HMAC secret the outside client
+	// mints its carrier tokens from, mode 0600. Its name is the one core reads
+	// from its secrets directory.
+	ExternalCarrierSecretFile = "relay-token"
+	// ExternalCarrierCAFile is the relay's carrier certificate in PEM, valid
+	// for 127.0.0.1.
+	ExternalCarrierCAFile = "relay-ca.pem"
+	// ExternalCarrierEnvFile holds KEY=value lines: RELAY_ENDPOINT (the carrier
+	// address to dial), BACKEND_ADDR (the home server streams are spliced to)
+	// and PUBLIC_HOST (the hostname to register). It is written last, by
+	// rename, so its presence means the other files and the relay are ready.
+	ExternalCarrierEnvFile = "carrier.env"
+)
+
+// latencyVerifier returns the relay's token verifier. An outside carrier mints
+// expiring HMAC tokens from a shared secret (returned), as a self-hosted relay
+// does; this repository's own tunnel client presents a fixed token.
+func latencyVerifier(opts LatencyOptions) (relay.TokenVerifier, []byte, error) {
+	if opts.ExternalCarrierDir == "" {
+		return relay.StaticTokenVerifier{
+			Token:     []byte(latencyToken),
+			CarrierID: "loadgen",
+			Hostnames: []string{latencyHost},
+		}, nil, nil
+	}
+	if opts.Transport != tunnel.TransportTCP {
+		return nil, nil, fmt.Errorf("an external carrier needs the %q transport, got %q", tunnel.TransportTCP, opts.Transport)
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, nil, err
+	}
+	secret := []byte(hex.EncodeToString(raw))
+	store, err := relay.NewFileHMACNonceStore(filepath.Join(opts.ExternalCarrierDir, "nonces.json"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("nonce store: %w", err)
+	}
+	return &relay.HMACTokenVerifier{
+		Secret:     secret,
+		CarrierID:  "external",
+		Hostnames:  []string{latencyHost},
+		NonceStore: store,
+	}, secret, nil
+}
+
+func writeExternalCarrierFiles(dir, carrierAddr, backendAddr string, secret []byte, relayCert tls.Certificate) error {
+	if err := os.WriteFile(filepath.Join(dir, ExternalCarrierSecretFile), secret, 0o600); err != nil {
+		return err
+	}
+	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: relayCert.Certificate[0]})
+	if err := os.WriteFile(filepath.Join(dir, ExternalCarrierCAFile), ca, 0o600); err != nil {
+		return err
+	}
+	env := fmt.Sprintf("RELAY_ENDPOINT=%s\nBACKEND_ADDR=%s\nPUBLIC_HOST=%s\n", carrierAddr, backendAddr, latencyHost)
+	tmp := filepath.Join(dir, ExternalCarrierEnvFile+".tmp")
+	if err := os.WriteFile(tmp, []byte(env), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, ExternalCarrierEnvFile))
+}
 
 // RunLatency starts a relay, a home server and a tunnel client in-process,
 // joins the client to the relay through opts.Link, and measures the control
@@ -105,6 +180,10 @@ func RunLatency(ctx context.Context, opts LatencyOptions) (LatencyResult, error)
 	if err != nil {
 		return LatencyResult{}, err
 	}
+	verifier, secret, err := latencyVerifier(opts)
+	if err != nil {
+		return LatencyResult{}, err
+	}
 	carrierListen := fmt.Sprintf("127.0.0.1:%d", opts.CarrierPort)
 	node, err := relay.Start(ctx, relay.Config{
 		PublicAddr:  "127.0.0.1:0",
@@ -115,13 +194,9 @@ func RunLatency(ctx context.Context, opts LatencyOptions) (LatencyResult, error)
 			Certificates: []tls.Certificate{relayCert},
 			MinVersion:   tls.VersionTLS13,
 		},
-		TokenVerifier: relay.StaticTokenVerifier{
-			Token:     []byte(latencyToken),
-			CarrierID: "loadgen",
-			Hostnames: []string{latencyHost},
-		},
-		StreamCap: opts.MediaStreams + 8,
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		TokenVerifier: verifier,
+		StreamCap:     opts.MediaStreams + 8,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		return LatencyResult{}, fmt.Errorf("start relay: %w", err)
@@ -132,21 +207,29 @@ func RunLatency(ctx context.Context, opts LatencyOptions) (LatencyResult, error)
 	if err != nil {
 		return LatencyResult{}, fmt.Errorf("start link: %w", err)
 	}
-	client, err := tunnel.Start(ctx, tunnel.Config{
-		RelayAddr:   carrierAddr,
-		BackendAddr: home.Addr().String(),
-		Token:       []byte(latencyToken),
-		Hostnames:   []string{latencyHost},
-		Transport:   opts.Transport,
-		TLSConfig: &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS13,
-		},
-	})
-	if err != nil {
-		return LatencyResult{}, fmt.Errorf("start tunnel client: %w", err)
+	readyWait := carrierReadyWait
+	if opts.ExternalCarrierDir != "" {
+		if err := writeExternalCarrierFiles(opts.ExternalCarrierDir, carrierAddr, home.Addr().String(), secret, relayCert); err != nil {
+			return LatencyResult{}, fmt.Errorf("write external carrier files: %w", err)
+		}
+		readyWait = externalCarrierReadyWait
+	} else {
+		client, err := tunnel.Start(ctx, tunnel.Config{
+			RelayAddr:   carrierAddr,
+			BackendAddr: home.Addr().String(),
+			Token:       []byte(latencyToken),
+			Hostnames:   []string{latencyHost},
+			Transport:   opts.Transport,
+			TLSConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				MinVersion:         tls.VersionTLS13,
+			},
+		})
+		if err != nil {
+			return LatencyResult{}, fmt.Errorf("start tunnel client: %w", err)
+		}
+		defer client.Close()
 	}
-	defer client.Close()
 
 	dial := func(kind byte) (net.Conn, error) {
 		conn, err := (&tls.Dialer{Config: &tls.Config{
@@ -166,7 +249,7 @@ func RunLatency(ctx context.Context, opts LatencyOptions) (LatencyResult, error)
 
 	// The relay refuses public connections until the carrier has registered.
 	var control net.Conn
-	for deadline := time.Now().Add(carrierReadyWait); ; {
+	for deadline := time.Now().Add(readyWait); ; {
 		if control, err = dial(streamKindEcho); err == nil {
 			break
 		}
@@ -402,10 +485,13 @@ func selfSignedCert(dnsName string) (tls.Certificate, error) {
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: dnsName},
 		DNSNames:     []string{dnsName},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		// Everything here listens on loopback; an outside carrier verifies the
+		// relay's certificate against the address it dials.
+		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)},
+		NotBefore:   time.Now().Add(-time.Minute),
+		NotAfter:    time.Now().Add(time.Hour),
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
 	if err != nil {

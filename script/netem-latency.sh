@@ -19,6 +19,12 @@
 #
 # Tunables: DURATION (10s), RATE_MBIT (20), DELAY_MS (10, one way), QUEUE_MS
 # (50), LOSSES ("0 1", percent), PORT (47443).
+#
+# To measure another tunnel client (core's home server client) as the carrier,
+# set CARRIER_CMD to a command that reads $CARRIER_DIR/carrier.env once it
+# appears, registers with the relay and carries until the relay goes away. It
+# runs inside the namespace, once per loss value, TCP carrier only. See
+# docs/relay-latency-budget.md.
 set -euo pipefail
 
 BIN="${BIN:-}"
@@ -28,6 +34,7 @@ DELAY_MS="${DELAY_MS:-10}"
 QUEUE_MS="${QUEUE_MS:-50}"
 LOSSES="${LOSSES:-0 1}"
 PORT="${PORT:-47443}"
+CARRIER_CMD="${CARRIER_CMD:-}"
 MTU=1500
 
 fail() { echo "netem-latency: $*" >&2; exit 1; }
@@ -84,7 +91,18 @@ echo "# kernel=$(uname -r)"
 for loss in $LOSSES; do
   shape "$loss"
   echo "# netem loss=${loss}%"
-  "$BIN" -mode latency -external-link -carrier-port "$PORT" -duration "$DURATION"
+  if [ -n "$CARRIER_CMD" ]; then
+    carrier_dir="$(mktemp -d)"
+    CARRIER_DIR="$carrier_dir" sh -c "$CARRIER_CMD" &
+    carrier_pid=$!
+    rc=0
+    "$BIN" -mode latency -external-link -carrier-port "$PORT" -duration "$DURATION" -external-carrier-dir "$carrier_dir" || rc=$?
+    wait "$carrier_pid" || echo "# carrier command exited $?" >&2
+    rm -rf "$carrier_dir"
+    [ "$rc" = "0" ] || exit "$rc"
+  else
+    "$BIN" -mode latency -external-link -carrier-port "$PORT" -duration "$DURATION"
+  fi
   for band in 20 30; do
     tc -s qdisc show dev lo handle "$band:" | sed -n 's/^ *Sent/# band '"$band"': Sent/p'
   done

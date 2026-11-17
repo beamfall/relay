@@ -45,6 +45,7 @@ func main() {
 		mediaStreams = flag.Int("media-streams", 1, "latency mode: bulk streams saturating the carrier")
 		externalLink = flag.Bool("external-link", false, "latency mode: no emulated link; the carrier is shaped outside the process (script/netem-latency.sh)")
 		carrierPort  = flag.Int("carrier-port", 0, "latency mode: fixed relay carrier port, TCP and UDP, for an outside shaper to match (0 picks free ports)")
+		carrierDir   = flag.String("external-carrier-dir", "", "latency mode: wait for an outside tunnel client (core's) as the TCP carrier instead of starting this repository's; the files it needs are written to this directory")
 	)
 	flag.Parse()
 	if *mode == "latency" {
@@ -58,6 +59,8 @@ func main() {
 			MediaStreams: *mediaStreams,
 			ExternalLink: *externalLink,
 			CarrierPort:  *carrierPort,
+
+			ExternalCarrierDir: *carrierDir,
 		}
 		if err := runLatency(opts, *lossPercent); err != nil {
 			log.Fatal(err)
@@ -212,7 +215,12 @@ func runLatency(opts loadtest.LatencyOptions, lossPercent float64) error {
 	if opts.ExternalLink {
 		losses = []float64{0}
 	}
-	for _, transport := range []string{tunnel.TransportTCP, tunnel.TransportQUIC} {
+	transports := []string{tunnel.TransportTCP, tunnel.TransportQUIC}
+	if opts.ExternalCarrierDir != "" {
+		// One run: the outside client registers once, on the TCP carrier.
+		transports, losses = transports[:1], losses[:1]
+	}
+	for _, transport := range transports {
 		for _, loss := range losses {
 			opts.Transport = transport
 			opts.Link.Loss = loss / 100

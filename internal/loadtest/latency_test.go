@@ -2,11 +2,18 @@ package loadtest
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/beamfall/relay/internal/relay"
 	"github.com/beamfall/relay/internal/tunnel"
 )
 
@@ -174,4 +181,100 @@ func TestPercentile(t *testing.T) {
 	if got := Percentile(nil, 0.99); got != 0 {
 		t.Errorf("Percentile(nil) = %d, want 0", got)
 	}
+}
+
+// TestExternalCarrierRegistersFromTheWrittenFiles covers the mode that measures
+// another tunnel client (core's): the run starts no carrier of its own, and a
+// client that knows only the files in the directory registers and carries.
+func TestExternalCarrierRegistersFromTheWrittenFiles(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	carrierErr := make(chan error, 1)
+	go func() { carrierErr <- runFileCarrier(ctx, dir) }()
+
+	result, err := RunLatency(ctx, LatencyOptions{
+		Transport:          tunnel.TransportTCP,
+		Duration:           300 * time.Millisecond,
+		ExternalLink:       true,
+		ExternalCarrierDir: dir,
+	})
+	if err != nil {
+		select {
+		case cerr := <-carrierErr:
+			t.Fatalf("%v (carrier: %v)", err, cerr)
+		default:
+			t.Fatal(err)
+		}
+	}
+	if result.Samples == 0 || result.Unanswered > 0 {
+		t.Fatalf("samples=%d unanswered=%d", result.Samples, result.Unanswered)
+	}
+}
+
+func TestExternalCarrierRefusesQUIC(t *testing.T) {
+	_, err := RunLatency(context.Background(), LatencyOptions{
+		Transport:          tunnel.TransportQUIC,
+		Duration:           time.Millisecond,
+		ExternalLink:       true,
+		ExternalCarrierDir: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("an external carrier on the QUIC transport was accepted")
+	}
+}
+
+// runFileCarrier stands in for the outside client: it waits for carrier.env,
+// then registers with a token minted from the secret file, verifying the relay
+// against the written certificate.
+func runFileCarrier(ctx context.Context, dir string) error {
+	var env []byte
+	for {
+		var err error
+		if env, err = os.ReadFile(filepath.Join(dir, ExternalCarrierEnvFile)); err == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	values := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(env)), "\n") {
+		key, value, _ := strings.Cut(line, "=")
+		values[key] = value
+	}
+	secret, err := os.ReadFile(filepath.Join(dir, ExternalCarrierSecretFile))
+	if err != nil {
+		return err
+	}
+	ca, err := os.ReadFile(filepath.Join(dir, ExternalCarrierCAFile))
+	if err != nil {
+		return err
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(ca) {
+		return errors.New("relay-ca.pem holds no certificate")
+	}
+	hostnames := []string{values["PUBLIC_HOST"]}
+	token, err := relay.MintHMACTunnelToken(secret, hostnames, time.Minute)
+	if err != nil {
+		return err
+	}
+	client, err := tunnel.Start(ctx, tunnel.Config{
+		RelayAddr:   values["RELAY_ENDPOINT"],
+		BackendAddr: values["BACKEND_ADDR"],
+		Token:       token,
+		Hostnames:   hostnames,
+		Transport:   tunnel.TransportTCP,
+		TLSConfig:   &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13},
+	})
+	if err != nil {
+		return err
+	}
+	<-ctx.Done()
+	client.Close()
+	return nil
 }
