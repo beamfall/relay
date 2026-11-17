@@ -78,7 +78,9 @@ func TestMetricsPublishesRetentionWindow(t *testing.T) {
 func TestMetricsLabelsAreBoundedOnly(t *testing.T) {
 	// The bounded, allowlisted label keys (ADR-0146 §9). Any other label key is a
 	// violation.
-	allowedLabelKeys := map[string]bool{"outcome": true, "le": true}
+	// `direction` (CORE-2246) is the established-stream histograms' two-valued
+	// forwarding direction, to_carrier or to_client.
+	allowedLabelKeys := map[string]bool{"outcome": true, "le": true, "direction": true}
 
 	assertBoundedLabels := func(t *testing.T, m *metrics) {
 		t.Helper()

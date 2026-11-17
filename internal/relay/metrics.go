@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -175,6 +176,27 @@ type metrics struct {
 	// newMetricsRegistry still exercise the atomics).
 	tunnelDials     *prometheus.CounterVec
 	tunnelSetupSecs prometheus.Histogram
+
+	// Established-stream latency (CORE-2246): the time each forwarded chunk
+	// spends in the relay, and how much that time changes from one chunk to the
+	// next on the same stream direction. Timing only, so the relay stays
+	// byte-blind; the one label is the bounded direction.
+	streamForwardSecs   *prometheus.HistogramVec
+	streamForwardJitter *prometheus.HistogramVec
+}
+
+// Stream forwarding directions, the only label values on the established-stream
+// latency histograms.
+const (
+	directionToCarrier = "to_carrier"
+	directionToClient  = "to_client"
+)
+
+// streamLatencyBuckets spans 50 µs to 5 s: a healthy relay forwards a chunk in
+// well under a millisecond, and a chunk held behind a full carrier can wait
+// for seconds.
+var streamLatencyBuckets = []float64{
+	0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
 }
 
 // initSLIs lazily constructs the SLI instruments so they exist even before a
@@ -192,6 +214,62 @@ func (m *metrics) initSLIs() {
 		Help:    "Carrier tunnel setup latency: first handshake frame read to verified+acked, in seconds.",
 		Buckets: prometheus.DefBuckets,
 	})
+	m.streamForwardSecs = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "beamfall_relay_stream_forward_seconds",
+		Help:    "Latency the relay adds to an established stream: time from a chunk being read on one side to written on the other, in seconds.",
+		Buckets: streamLatencyBuckets,
+	}, []string{"direction"})
+	m.streamForwardJitter = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "beamfall_relay_stream_forward_jitter_seconds",
+		Help:    "Jitter the relay adds to an established stream: absolute change in forwarding latency between consecutive chunks of one stream direction, in seconds.",
+		Buckets: streamLatencyBuckets,
+	}, []string{"direction"})
+	for _, direction := range []string{directionToCarrier, directionToClient} {
+		m.streamForwardSecs.WithLabelValues(direction)
+		m.streamForwardJitter.WithLabelValues(direction)
+	}
+}
+
+// forwardTimer times one direction of one established stream. A single copy
+// goroutine owns it: Read stamps the moment a chunk arrives, and observe,
+// called once that chunk has been written, records how long the relay held it.
+// It reads the clock and nothing else, so the payload stays opaque.
+type forwardTimer struct {
+	src     io.Reader
+	latency prometheus.Observer
+	jitter  prometheus.Observer
+	readAt  time.Time
+	last    time.Duration
+	primed  bool
+}
+
+// newForwardTimer wraps src for the given direction. Without the instruments
+// (a metrics value built outside newMetricsRegistry) observe is a no-op.
+func (m *metrics) newForwardTimer(src io.Reader, direction string) *forwardTimer {
+	t := &forwardTimer{src: src}
+	if m.streamForwardSecs != nil {
+		t.latency = m.streamForwardSecs.WithLabelValues(direction)
+		t.jitter = m.streamForwardJitter.WithLabelValues(direction)
+	}
+	return t
+}
+
+func (t *forwardTimer) Read(p []byte) (int, error) {
+	n, err := t.src.Read(p)
+	t.readAt = time.Now()
+	return n, err
+}
+
+func (t *forwardTimer) observe() {
+	if t.latency == nil {
+		return
+	}
+	held := time.Since(t.readAt)
+	t.latency.Observe(held.Seconds())
+	if t.primed {
+		t.jitter.Observe((held - t.last).Abs().Seconds())
+	}
+	t.last, t.primed = held, true
 }
 
 // recordDial records the outcome of one carrier handshake attempt (ADR-0146 §8).
@@ -217,9 +295,9 @@ func (m *metrics) observeSetupLatency(d time.Duration) {
 // counters that the hot path already maintains — no double-accounting and no
 // hot-path change (ADR-0146 §10). The pre-existing series stay label-free
 // aggregates (ADR-0103); the only labels are on the SLI set (ADR-0146 §8): the
-// dial counter's bounded `outcome` error class and the setup-latency histogram's
-// `le` buckets — both low-cardinality and free of any identifier/secret
-// (ADR-0146 §9). Go/process collectors are deliberately not registered to keep
+// dial counter's bounded `outcome` error class, the histograms' `le` buckets and
+// the established-stream histograms' two-valued `direction` — all
+// low-cardinality and free of any identifier/secret (ADR-0146 §9). Go/process collectors are deliberately not registered to keep
 // the surface minimal and deterministic.
 func (m *metrics) newMetricsRegistry() *prometheus.Registry {
 	m.initSLIs()
@@ -330,7 +408,7 @@ func (m *metrics) newMetricsRegistry() *prometheus.Registry {
 		}
 	}
 
-	reg.MustRegister(m.tunnelDials, m.tunnelSetupSecs)
+	reg.MustRegister(m.tunnelDials, m.tunnelSetupSecs, m.streamForwardSecs, m.streamForwardJitter)
 	return reg
 }
 

@@ -1449,8 +1449,10 @@ const abruptSpliceDeadline = 250 * time.Millisecond
 // exposure instead.
 func (s *Server) splice(ctx context.Context, carrier *carrier, upstream net.Conn, client net.Conn, clientReader io.Reader) {
 	done := make(chan spliceResult, 2)
-	copyBytes := func(dst io.Writer, src io.Reader) {
-		_, err := copyWithLimit(ctx, dst, src, carrier.limiter, carrier.reserveBytes, func(reserved, written int64) {
+	copyBytes := func(dst io.Writer, src io.Reader, direction string) {
+		timer := s.metrics.newForwardTimer(src, direction)
+		_, err := copyWithLimit(ctx, dst, timer, carrier.limiter, carrier.reserveBytes, func(reserved, written int64) {
+			timer.observe()
 			if written > 0 {
 				s.metrics.bytesRelayed.Add(written)
 			}
@@ -1466,8 +1468,8 @@ func (s *Server) splice(ctx context.Context, carrier *carrier, upstream net.Conn
 		}
 		done <- spliceResult{clean: err == nil}
 	}
-	go copyBytes(upstream, clientReader)
-	go copyBytes(client, upstream)
+	go copyBytes(upstream, clientReader, directionToCarrier)
+	go copyBytes(client, upstream, directionToClient)
 
 	if r := <-done; !r.clean {
 		// One side died abruptly. Bound both blocked operations before aborting

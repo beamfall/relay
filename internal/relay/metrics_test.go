@@ -259,6 +259,12 @@ func TestPrometheusHandlerReturnsExpectedMetricNames(t *testing.T) {
 		// only surfaces once a labelled outcome is observed — TestTunnelDialSLIsExposed
 		// covers that after real handshakes.
 		"beamfall_relay_tunnel_setup_seconds",
+		// Established-stream latency (CORE-2246): both directions are present
+		// before any stream has been relayed.
+		`beamfall_relay_stream_forward_seconds_count{direction="to_carrier"} 0`,
+		`beamfall_relay_stream_forward_seconds_count{direction="to_client"} 0`,
+		`beamfall_relay_stream_forward_jitter_seconds_count{direction="to_carrier"} 0`,
+		`beamfall_relay_stream_forward_jitter_seconds_count{direction="to_client"} 0`,
 	}
 	for _, name := range required {
 		if !strings.Contains(body, name) {
@@ -391,4 +397,40 @@ func TestNonceCacheGaugesExposeNoPlantedIdentifiers(t *testing.T) {
 			t.Fatalf("metrics body leaked planted identifier %q:\n%s", forbidden, body)
 		}
 	}
+}
+
+// TestForwardTimerRecordsLatencyAndJitter proves the established-stream
+// histograms are fed per forwarded chunk: one latency observation per chunk,
+// one jitter observation per consecutive pair, under the direction label only.
+func TestForwardTimerRecordsLatencyAndJitter(t *testing.T) {
+	m := &metrics{}
+	handler := m.metricsHandler()
+	timer := m.newForwardTimer(strings.NewReader("abcdef"), directionToClient)
+	buf := make([]byte, 2)
+	for range 3 {
+		if _, err := timer.Read(buf); err != nil {
+			t.Fatal(err)
+		}
+		timer.observe()
+	}
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rr.Body.String()
+	for _, want := range []string{
+		`beamfall_relay_stream_forward_seconds_count{direction="to_client"} 3`,
+		`beamfall_relay_stream_forward_jitter_seconds_count{direction="to_client"} 2`,
+		`beamfall_relay_stream_forward_seconds_count{direction="to_carrier"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics body missing %q", want)
+		}
+	}
+
+	// A metrics value with no registry still forwards.
+	bare := (&metrics{}).newForwardTimer(strings.NewReader("x"), directionToCarrier)
+	if n, err := bare.Read(buf); n != 1 || err != nil {
+		t.Fatalf("Read = %d, %v", n, err)
+	}
+	bare.observe()
 }

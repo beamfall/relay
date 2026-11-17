@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/beamfall/relay/internal/loadtest"
 	"github.com/beamfall/relay/internal/relay"
 	"github.com/beamfall/relay/internal/tunnel"
 )
@@ -34,7 +35,28 @@ func main() {
 		fairUse   = flag.Bool("fair-use", false, "enable fair-use accounting with high test limits")
 		transport = flag.String("transport", tunnel.TransportTCP, "carrier transport: tcp (v1 yamux) or quic (ADR-0018 v2)")
 	)
+	// Latency mode (CORE-2246) has its own flags; -streams, -mbps, -fair-use
+	// and -transport apply to the throughput soak only.
+	var (
+		mode         = flag.String("mode", "throughput", "throughput (soak) or latency (control-stream latency under media load, both carriers)")
+		lossPercent  = flag.Float64("loss-percent", 1, "latency mode: loss injected on the emulated carrier link for the lossy runs")
+		linkMbps     = flag.Float64("link-mbps", 20, "latency mode: emulated carrier link rate in megabits per second")
+		linkDelay    = flag.Duration("link-delay", 10*time.Millisecond, "latency mode: emulated one-way carrier link delay")
+		mediaStreams = flag.Int("media-streams", 1, "latency mode: bulk streams saturating the carrier")
+	)
 	flag.Parse()
+	if *mode == "latency" {
+		link := loadtest.ReferenceLink()
+		link.BitsPerSecond = *linkMbps * 1000 * 1000
+		link.Delay = *linkDelay
+		if err := runLatency(*duration, link, *lossPercent, *mediaStreams); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if *mode != "throughput" {
+		log.Fatalf("mode must be \"throughput\" or \"latency\", got %q", *mode)
+	}
 	if *streams < 1 {
 		log.Fatal("streams must be at least 1")
 	}
@@ -168,6 +190,34 @@ func main() {
 	fmt.Printf("per_stream_mbps_max=%.3f\n", floatPercentile(perStreamMbps, 1.0))
 	fmt.Printf("relayd_in_process_max_rss_bytes=%d\n", maxRSSBytes())
 	fmt.Printf("relay_admin_addr=%s\n", node.AdminAddr())
+}
+
+// runLatency reports the control stream's round-trip latency while media
+// saturates the same carrier, for each carrier with and without loss. The link
+// is emulated in-process (loadtest.Link), so the loss is real packet loss for
+// QUIC and a modelled retransmission stall for TCP.
+func runLatency(duration time.Duration, link loadtest.Link, lossPercent float64, mediaStreams int) error {
+	for _, transport := range []string{tunnel.TransportTCP, tunnel.TransportQUIC} {
+		for _, loss := range []float64{0, lossPercent} {
+			link.Loss = loss / 100
+			result, err := loadtest.RunLatency(context.Background(), loadtest.LatencyOptions{
+				Transport:    transport,
+				Link:         link,
+				Duration:     duration,
+				Warmup:       2 * time.Second,
+				MediaStreams: mediaStreams,
+			})
+			if err != nil {
+				return fmt.Errorf("%s carrier, %g%% loss: %w", transport, loss, err)
+			}
+			ms := func(d time.Duration) float64 { return d.Seconds() * 1000 }
+			fmt.Printf("control_latency transport=%s loss_percent=%g media_streams=%d samples=%d unanswered=%d p50_ms=%.1f p99_ms=%.1f p999_ms=%.1f max_ms=%.1f media_mbps=%.1f budget_p99_ms=%.0f within_budget=%t\n",
+				transport, loss, mediaStreams, result.Samples, result.Unanswered,
+				ms(result.P50), ms(result.P99), ms(result.P999), ms(result.Max), result.MediaMbps,
+				ms(loadtest.ControlP99Budget), result.Unanswered == 0 && result.P99 <= loadtest.ControlP99Budget)
+		}
+	}
+	return nil
 }
 
 // floatPercentile returns the p-quantile of a sorted slice (empty -> 0).

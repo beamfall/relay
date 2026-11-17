@@ -514,6 +514,8 @@ alert fires.
   - `beamfall_relay_bytes_relayed_total`
   - `beamfall_relay_handshake_failures_total`
   - `beamfall_relay_tunnel_dials_total{outcome}` — carrier handshake attempts by outcome: `success`, `unauthorized` (bad, expired, or replayed token), `nonce_store_full` (valid token refused because the replay nonce store is full; see "Replay Nonce Store Sizing"), `invalid`, `error`.
+  - `beamfall_relay_stream_forward_seconds{direction}` — latency the relay adds to an established stream: the time from a chunk being read on one side to written on the other. `direction` is `to_carrier` (viewer to home server) or `to_client`. A rising upper tail means chunks are waiting on a full carrier or a slow viewer. See [relay-latency-budget.md](relay-latency-budget.md).
+  - `beamfall_relay_stream_forward_jitter_seconds{direction}` — the absolute change in that latency between consecutive chunks of one stream direction.
   - `beamfall_relay_nonce_store_fill_ratio` — hmac mode only: live replay nonce-store entries divided by `--hmac-nonce-store-capacity`. New carrier dials are refused at `1`; alert at `0.8` (see "Replay Nonce Store Sizing").
   - `beamfall_relay_public_over_cap_total` — public connections dropped at accept because the global concurrent-connection cap (`MaxPublicConns`) was exhausted; a rising counter signals a connection flood or an undersized cap. Raise or lower the cap with `--max-public-conns` / `RELAYD_MAX_PUBLIC_CONNS` (default 1024; 0 uses the built-in default).
   - `beamfall_relay_public_per_ip_over_cap_total` — public connections dropped at accept because a single source prefix (IPv4 /32 or IPv6 /64) already held its concurrent-connection cap (`--max-public-conns-per-ip` / `RELAYD_MAX_PUBLIC_CONNS_PER_IP`, default 64; 0 uses the built-in default). A rising counter with a small distinct-source set signals a slow-loris / partial-record flood from one origin. See "Public-listener flood posture" below.
@@ -522,7 +524,8 @@ alert fires.
   - `beamfall_relay_fairuse_soft_limited_tunnels`
   - `beamfall_relay_fairuse_throttled_tunnels`
 
-Metrics are aggregate-only and label-free. They do not export tunnel ids, hostnames,
+Metrics are aggregate-only. The only labels are the bounded `outcome` and `direction` values
+above. They do not export tunnel ids, hostnames,
 account ids, tokens, payload bytes, or per-stream records. Operational logs are separate
 transient operator logs; public connection logs redact hostnames, remote addresses, and carrier ids
 unless explicitly disabled, and never include tunnel token bytes or relayed payload bytes.
