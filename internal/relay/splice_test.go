@@ -329,3 +329,31 @@ func (c *capturingConn) RemoteAddr() net.Addr             { panic("unused") }
 func (c *capturingConn) SetDeadline(time.Time) error      { return nil }
 func (c *capturingConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *capturingConn) SetWriteDeadline(time.Time) error { return nil }
+
+type panickingReader struct{}
+
+func (panickingReader) Read([]byte) (int, error) { panic("injected copy panic") }
+
+// TestSplicePanicInCopyTearsDownTheStream (CORE-2254): a panic in one copy
+// direction is outside the connection handler's recover. It must be counted,
+// must not escape, and must end the stream like an abrupt disconnect.
+func TestSplicePanicInCopyTearsDownTheStream(t *testing.T) {
+	s := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	c := &carrier{}
+	upstream := newBlockingConn()
+	client := &erroringConn{}
+
+	returned := make(chan struct{})
+	go func() {
+		s.splice(context.Background(), c, upstream, client, panickingReader{})
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("splice did not return after a copy direction panicked")
+	}
+	if got := s.metrics.connPanics.Load(); got != 1 {
+		t.Fatalf("connection panics counted = %d, want 1", got)
+	}
+}

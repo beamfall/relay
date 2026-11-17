@@ -623,7 +623,7 @@ func (s *Server) acceptPublic(ctx context.Context) {
 			defer s.wg.Done()
 			defer func() { <-s.publicSlots }()
 			defer s.publicPerIP.release(ip)
-			defer s.recoverConnPanic("public")
+			defer s.recoverConnPanic("public", func() { _ = conn.Close() })
 			s.handlePublicConn(ctx, conn)
 		}()
 	}
@@ -668,7 +668,7 @@ func (s *Server) acceptCarriers(ctx context.Context) {
 			defer s.wg.Done()
 			defer stopPending()
 			defer endPending()
-			defer s.recoverConnPanic("carrier")
+			defer s.recoverConnPanic("carrier", func() { _ = conn.Close() })
 			// Back off a repeat-offender source before its handshake. The sleep
 			// holds only a pending admission, never a carrier slot
 			// (SECREV-RELAY-8), and ends early if the admission is evicted.
@@ -697,27 +697,27 @@ func (s *Server) admitPendingCarrier(remote net.Addr, evict func()) (func(), boo
 	select {
 	case s.carrierAdmissions <- struct{}{}:
 	default:
+		// The evicted connection's admission passes to this one, so the
+		// number admitted never dips below or rises above the cap.
 		if !s.evictPendingCarrier() {
-			s.carrierPendingPerIP.release(source)
-			s.metrics.carrierOverCap.Add(1)
-			return nil, false
-		}
-		select {
-		case s.carrierAdmissions <- struct{}{}:
-		default:
 			s.carrierPendingPerIP.release(source)
 			s.metrics.carrierOverCap.Add(1)
 			return nil, false
 		}
 	}
 	entry := &pendingCarrier{source: source, evict: evict}
-	entry.release = sync.OnceFunc(func() {
+	entry.release = func() {
 		s.pendingMu.Lock()
+		if entry.done {
+			s.pendingMu.Unlock()
+			return
+		}
+		entry.done = true
 		delete(s.pendingCarriers, entry)
 		s.pendingMu.Unlock()
 		<-s.carrierAdmissions
 		s.carrierPendingPerIP.release(source)
-	})
+	}
 	s.pendingMu.Lock()
 	s.pendingSeq++
 	entry.seq = s.pendingSeq
@@ -730,17 +730,20 @@ func (s *Server) admitPendingCarrier(remote net.Addr, evict func()) (func(), boo
 }
 
 // pendingCarrier is one unauthenticated carrier connection holding a pending
-// admission.
+// admission. done, guarded by Server.pendingMu, is set by whichever of the
+// handler's release and an eviction comes first; the other then does nothing,
+// so a connection that finished its handshake is never closed by an eviction.
 type pendingCarrier struct {
 	source  string
 	seq     uint64
+	done    bool
 	evict   func()
 	release func()
 }
 
-// evictPendingCarrier frees one pending admission by closing the oldest
-// pending connection of the source that holds the most, and reports whether it
-// freed one. Only the accept loops call it.
+// evictPendingCarrier closes the oldest pending connection of the source that
+// holds the most and reports whether it did. The victim's admission is not
+// returned to the budget: the caller owns it from then on.
 func (s *Server) evictPendingCarrier() bool {
 	s.pendingMu.Lock()
 	perSource := make(map[string]int, len(s.pendingCarriers))
@@ -755,12 +758,16 @@ func (s *Server) evictPendingCarrier() bool {
 			victim = entry
 		}
 	}
+	if victim != nil {
+		victim.done = true
+		delete(s.pendingCarriers, victim)
+	}
 	s.pendingMu.Unlock()
 	if victim == nil {
 		return false
 	}
 	s.metrics.carrierPendingEvicted.Add(1)
-	victim.release()
+	s.carrierPendingPerIP.release(victim.source)
 	if victim.evict != nil {
 		victim.evict()
 	}
@@ -770,13 +777,18 @@ func (s *Server) evictPendingCarrier() bool {
 // recoverConnPanic stops a panic in one connection's goroutine from taking
 // relayd, and every home it serves, down with it (CORE-2254). It counts the
 // panic and logs its value and stack, which carry code locations and no
-// connection payload. The handler's own deferred Close has already closed the
-// connection. Call it deferred.
-func (s *Server) recoverConnPanic(listener string) {
+// connection payload, then runs closeConn, because a panic before the handler
+// took the connection leaves it open. Call it deferred.
+func (s *Server) recoverConnPanic(listener string, closeConn func()) {
 	r := recover()
 	if r == nil {
 		return
 	}
+	defer closeConn()
+	s.reportConnPanic(listener, r)
+}
+
+func (s *Server) reportConnPanic(listener string, r any) {
 	s.metrics.connPanics.Add(1)
 	s.logger.Error("connection handler panicked; connection closed", "listener", listener, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 }
@@ -858,7 +870,7 @@ func (s *Server) acceptQUICCarriers(ctx context.Context) {
 			defer s.wg.Done()
 			defer stopPending()
 			defer endPending()
-			defer s.recoverConnPanic("quic_carrier")
+			defer s.recoverConnPanic("quic_carrier", func() { _ = conn.CloseWithError(0, "") })
 			// Back off a repeat-offender source before its handshake, holding no
 			// carrier slot (SECREV-RELAY-8). Mirrors acceptCarriers.
 			s.handshakeThrottle.backoffBefore(pendingCtx, conn.RemoteAddr())
@@ -1554,9 +1566,20 @@ const abruptSpliceDeadline = 250 * time.Millisecond
 func (s *Server) splice(ctx context.Context, carrier *carrier, upstream net.Conn, client net.Conn, clientReader io.Reader) {
 	done := make(chan spliceResult, 2)
 	copyBytes := func(dst io.Writer, src io.Reader, direction string) {
+		// A panic here is outside the connection handler's recover. Report it
+		// as an abrupt end so splice tears both halves down (CORE-2254).
+		defer func() {
+			if r := recover(); r != nil {
+				s.reportConnPanic("splice", r)
+				done <- spliceResult{}
+			}
+		}()
 		timer := s.metrics.newForwardTimer(src, direction)
 		_, err := copyWithLimit(ctx, dst, timer, carrier.limiter, carrier.reserveBytes, func(reserved, written int64) {
-			timer.observe()
+			// A failed or cut-short write forwarded nothing to time.
+			if written == reserved {
+				timer.observe()
+			}
 			if written > 0 {
 				s.metrics.bytesRelayed.Add(written)
 			}
