@@ -42,6 +42,9 @@ if [ "${NETEM_LATENCY_IN_NS:-}" != "1" ]; then
   NETEM_LATENCY_IN_NS=1 exec unshare --net -- "$0" "$@"
 fi
 
+# Never shape the host's loopback, whatever the environment says.
+[ "$(readlink /proc/self/ns/net)" != "$(readlink /proc/1/ns/net)" ] || fail "not in a private network namespace; refusing to touch the host's loopback."
+
 # Inside the private namespace from here on. It disappears with this process,
 # so there is nothing to tear down.
 ip link set lo up

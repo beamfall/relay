@@ -49,9 +49,9 @@ The options not taken for 1.0:
 How the bound works: on Linux `TCP_NOTSENT_LOWAT` makes the kernel refuse a write while 16 KiB is
 unsent, so the writer waits. macOS applies that option only to writability events, so there each
 write first waits until the send buffer holds no more than 16 KiB beyond what the congestion and
-peer windows allow in flight (`TCP_CONNECTION_INFO`, polled every millisecond). Neither limits
-bytes in flight, so throughput is unchanged (media moved 40.4 Mbit/s before and after). A 4 KiB
-bound measured the same as 16 KiB.
+peer windows allow in flight (`TCP_CONNECTION_INFO`, polled every 0.1 ms at first, then every
+millisecond). Neither limits bytes in flight, so throughput is about the same (see the "Media moved" column). Under real loss a
+4 KiB bound measured the same as 16 KiB.
 
 Limits of what ships:
 
@@ -69,8 +69,9 @@ Go 1.27.4, 2026-11-17. "Before" is the carrier without the bound.
 
 `script/netem-latency.sh` on WSL2 (kernel 6.18.33.2-microsoft-standard-WSL2, 32 cores). The
 loadgen dials the relay's carrier port directly; netem shapes that port in a private network
-namespace, each direction separately: 20 Mbit/s, 10 ms delay, 83-packet (50 ms) queue, loopback
-MTU 1500 with segmentation offload off. Loss here is real packet loss for both carriers.
+namespace, each direction separately: 20 Mbit/s, 10 ms delay, an 83-packet netem limit (50 ms at
+the link rate; it also counts the packets in the delay line, so the waiting queue is nearer 40 ms),
+loopback MTU 1500 with segmentation offload off. Loss here is real packet loss for both carriers.
 
 | Carrier | Loss | | p50 | p99 | p99.9 | max | Media moved (both ways) |
 |---|---|---|---|---|---|---|---|
@@ -81,8 +82,8 @@ MTU 1500 with segmentation offload off. Loss here is real packet loss for both c
 | QUIC | 0% | | 102.1 | 161.7 | 226.4 | 236.4 | 36.0 Mbit/s |
 | QUIC | 1% | | 33.1 | 65.7 | 75.3 | 78.6 | 21.1 Mbit/s |
 
-Two more bounded runs with 1% loss gave a TCP p99 of 349.9 and 327.8 ms. This is one host and a
-virtualised kernel; treat the figures as indicative.
+Two runs with a 4 KiB bound and 1% loss gave a TCP p99 of 349.9 and 327.8 ms, no better than
+16 KiB. This is one host and a virtualised kernel; treat the figures as indicative.
 
 ### Linux, in-process link
 
@@ -128,7 +129,9 @@ accepted socket, or again before each read did not change it. That queue does no
 link, so the macOS TCP rows overstate the carrier's latency and the test holds the TCP carrier on
 Linux only. The macOS write path has its own test
 (`TestBoundUnsentBacklogHoldsWriter`), which shows the writer is held; it has not been measured
-end to end on a real link from a Mac.
+end to end on a real link from a Mac, and its polling has not been measured above the 20 Mbit/s
+reference link: on a much faster link the poll interval, not the congestion window, could pace a
+saturated writer.
 
 ### What the numbers say
 

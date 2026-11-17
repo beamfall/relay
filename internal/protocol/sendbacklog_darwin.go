@@ -9,7 +9,11 @@ import (
 )
 
 const (
-	unsentPollInterval = time.Millisecond
+	// A held writer rechecks quickly at first, so a fast link is not paced by
+	// the poll, then every unsentPollInterval.
+	unsentFastPollInterval = 100 * time.Microsecond
+	unsentFastPollFor      = 2 * time.Millisecond
+	unsentPollInterval     = time.Millisecond
 	// unsentMaxWait bounds one write's wait, so a connection whose peer has
 	// stopped reading falls through to the kernel's own blocking and the
 	// caller's write deadline instead of polling forever.
@@ -34,12 +38,20 @@ type unsentBoundConn struct {
 }
 
 func (c *unsentBoundConn) Write(p []byte) (int, error) {
-	for waited := time.Duration(0); waited < unsentMaxWait; waited += unsentPollInterval {
+	for start := time.Now(); ; {
 		unsent, ok := c.unsent()
 		if !ok || unsent <= CarrierUnsentLowat {
 			break
 		}
-		time.Sleep(unsentPollInterval)
+		waited := time.Since(start)
+		if waited >= unsentMaxWait {
+			break
+		}
+		if waited < unsentFastPollFor {
+			time.Sleep(unsentFastPollInterval)
+		} else {
+			time.Sleep(unsentPollInterval)
+		}
 	}
 	return c.TCPConn.Write(p)
 }
