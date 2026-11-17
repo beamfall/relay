@@ -26,8 +26,8 @@ bytes in flight.
 
 On the reference link of `docs/relay-latency-budget.md`, the round-trip p99 of a small control
 stream SHALL be at most 250 ms on the TLS/TCP carrier while a media stream saturates the same
-carrier in both directions, with and without 1% packet loss, when both carrier ends bound their
-unsent send backlog.
+carrier in both directions, without loss and with the in-process link's modelled 1% loss, when both
+carrier ends bound their unsent send backlog. Real packet loss is outside this requirement.
 
 #### Scenario: Saturated carrier
 
@@ -36,5 +36,5 @@ unsent send backlog.
 
 #### Scenario: Saturated carrier with loss
 
-- **WHEN** the same run loses 1% of carrier segments
+- **WHEN** the same run delays 1% of carrier segments and everything behind them by one round trip
 - **THEN** the control stream's round-trip p99 is at most 250 ms and every message is echoed

@@ -2,52 +2,87 @@ package loadtest
 
 import (
 	"context"
+	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/beamfall/relay/internal/tunnel"
 )
 
-// TestControlStreamLatencyBudget enforces docs/relay-latency-budget.md: on the
-// QUIC carrier a small control stream keeps its round-trip p99 inside
-// ControlP99Budget while a media stream saturates the same carrier, with and
-// without 1% packet loss. The v1 TCP carrier is not held to the budget: it
-// misses it several times over (see the doc), which is why the doc recommends
-// QUIC for this traffic.
+// TestControlStreamLatencyBudget enforces docs/relay-latency-budget.md: a small
+// control stream keeps its round-trip p99 inside ControlP99Budget while a media
+// stream saturates the same carrier, with and without 1% loss, on both
+// carriers.
+//
+// The TLS/TCP carrier is held on Linux only. Its figure depends on the carrier
+// bounding its unsent backlog (CORE-2262) and on the emulated link adding no
+// buffer of its own. On macOS loopback ignores the small receive buffer the
+// link's proxy sockets ask for, which adds a queue of several hundred
+// kilobytes that the reference link does not have.
 func TestControlStreamLatencyBudget(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs a saturated carrier for several seconds")
 	}
-	for name, loss := range map[string]float64{"no loss": 0, "1% loss": 0.01} {
-		t.Run(name, func(t *testing.T) {
-			link := ReferenceLink()
-			link.Loss = loss
-			opts := LatencyOptions{
-				Transport:    tunnel.TransportQUIC,
-				Link:         link,
-				Duration:     4 * time.Second,
-				Warmup:       time.Second,
-				MediaStreams: 1,
-			}
-			result, err := RunLatency(context.Background(), opts)
+	for _, transport := range []string{tunnel.TransportTCP, tunnel.TransportQUIC} {
+		for _, loss := range []float64{0, 0.01} {
+			t.Run(fmt.Sprintf("%s/%g%% loss", transport, loss*100), func(t *testing.T) {
+				if transport == tunnel.TransportTCP && runtime.GOOS != "linux" {
+					t.Skipf("the emulated TCP link is only faithful on Linux, not %s", runtime.GOOS)
+				}
+				link := ReferenceLink()
+				link.Loss = loss
+				opts := LatencyOptions{
+					Transport:    transport,
+					Link:         link,
+					Duration:     4 * time.Second,
+					Warmup:       time.Second,
+					MediaStreams: 1,
+				}
+				result, err := RunLatency(context.Background(), opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Logf("samples=%d unanswered=%d p50=%s p99=%s p99.9=%s max=%s media=%.1f Mbit/s",
+					result.Samples, result.Unanswered, result.P50, result.P99, result.P999, result.Max, result.MediaMbps)
+				// Half the offered messages is far below any healthy run and still
+				// enough for a p99.
+				if offered := int(opts.Duration / (5 * time.Millisecond)); result.Samples < offered/2 {
+					t.Fatalf("only %d of ~%d control messages were echoed", result.Samples, offered)
+				}
+				if result.Unanswered > 0 {
+					t.Fatalf("%d control messages were not echoed within %s", result.Unanswered, echoGrace)
+				}
+				if result.MediaMbps < 1 {
+					t.Fatalf("media moved %.2f Mbit/s: the carrier was not loaded", result.MediaMbps)
+				}
+				if result.P99 > ControlP99Budget {
+					t.Fatalf("control-stream p99 %s exceeds the %s budget", result.P99, ControlP99Budget)
+				}
+			})
+		}
+	}
+}
+
+// TestExternalLinkDialsTheCarrierDirectly covers the mode the netem script
+// uses: no emulated link, so an idle control stream is not delayed.
+func TestExternalLinkDialsTheCarrierDirectly(t *testing.T) {
+	for _, transport := range []string{tunnel.TransportTCP, tunnel.TransportQUIC} {
+		t.Run(transport, func(t *testing.T) {
+			result, err := RunLatency(context.Background(), LatencyOptions{
+				Transport:    transport,
+				Link:         Link{Delay: time.Second},
+				Duration:     300 * time.Millisecond,
+				ExternalLink: true,
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Logf("samples=%d unanswered=%d p50=%s p99=%s p99.9=%s max=%s media=%.1f Mbit/s",
-				result.Samples, result.Unanswered, result.P50, result.P99, result.P999, result.Max, result.MediaMbps)
-			// Half the offered messages is far below any healthy run and still
-			// enough for a p99.
-			if offered := int(opts.Duration / (5 * time.Millisecond)); result.Samples < offered/2 {
-				t.Fatalf("only %d of ~%d control messages were echoed", result.Samples, offered)
+			if result.Samples == 0 || result.Unanswered > 0 {
+				t.Fatalf("samples=%d unanswered=%d", result.Samples, result.Unanswered)
 			}
-			if result.Unanswered > 0 {
-				t.Fatalf("%d control messages were not echoed within %s", result.Unanswered, echoGrace)
-			}
-			if result.MediaMbps < 1 {
-				t.Fatalf("media moved %.2f Mbit/s: the carrier was not loaded", result.MediaMbps)
-			}
-			if result.P99 > ControlP99Budget {
-				t.Fatalf("control-stream p99 %s exceeds the %s budget", result.P99, ControlP99Budget)
+			if result.P50 >= time.Second {
+				t.Fatalf("p50 %s: the emulated link was still in the path", result.P50)
 			}
 		})
 	}

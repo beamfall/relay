@@ -41,6 +41,12 @@ bytes, so it limits throughput to the buffer size per round trip.
   private network namespace; `relay-loadgen -mode latency` gains the flags it needs.
 - `docs/relay-latency-budget.md` records the decision and the new numbers.
 
+## Measured result
+
+Through a real `tc`/netem link on Linux the TCP carrier's control p99 falls from 983 to 159 ms
+without loss and from 1571 to 353 ms with 1% loss. The lossy case is still over the budget: what
+remains is TCP loss recovery, which this change cannot remove. QUIC is inside the budget in both.
+
 ## Not in this change
 
 - Core's own tunnel client (`internal/remoteaccess` in beamfall/core) is the sending end for media

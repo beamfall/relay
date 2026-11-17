@@ -43,13 +43,23 @@ func main() {
 		linkMbps     = flag.Float64("link-mbps", 20, "latency mode: emulated carrier link rate in megabits per second")
 		linkDelay    = flag.Duration("link-delay", 10*time.Millisecond, "latency mode: emulated one-way carrier link delay")
 		mediaStreams = flag.Int("media-streams", 1, "latency mode: bulk streams saturating the carrier")
+		externalLink = flag.Bool("external-link", false, "latency mode: no emulated link; the carrier is shaped outside the process (script/netem-latency.sh)")
+		carrierPort  = flag.Int("carrier-port", 0, "latency mode: fixed relay carrier port, TCP and UDP, for an outside shaper to match (0 picks free ports)")
 	)
 	flag.Parse()
 	if *mode == "latency" {
 		link := loadtest.ReferenceLink()
 		link.BitsPerSecond = *linkMbps * 1000 * 1000
 		link.Delay = *linkDelay
-		if err := runLatency(*duration, link, *lossPercent, *mediaStreams); err != nil {
+		opts := loadtest.LatencyOptions{
+			Link:         link,
+			Duration:     *duration,
+			Warmup:       2 * time.Second,
+			MediaStreams: *mediaStreams,
+			ExternalLink: *externalLink,
+			CarrierPort:  *carrierPort,
+		}
+		if err := runLatency(opts, *lossPercent); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -195,24 +205,28 @@ func main() {
 // runLatency reports the control stream's round-trip latency while media
 // saturates the same carrier, for each carrier with and without loss. The link
 // is emulated in-process (loadtest.Link), so the loss is real packet loss for
-// QUIC and a modelled retransmission stall for TCP.
-func runLatency(duration time.Duration, link loadtest.Link, lossPercent float64, mediaStreams int) error {
+// QUIC and a modelled retransmission stall for TCP. With an external link each
+// carrier runs once and the loss is whatever the outside shaper applies.
+func runLatency(opts loadtest.LatencyOptions, lossPercent float64) error {
+	losses := []float64{0, lossPercent}
+	if opts.ExternalLink {
+		losses = []float64{0}
+	}
 	for _, transport := range []string{tunnel.TransportTCP, tunnel.TransportQUIC} {
-		for _, loss := range []float64{0, lossPercent} {
-			link.Loss = loss / 100
-			result, err := loadtest.RunLatency(context.Background(), loadtest.LatencyOptions{
-				Transport:    transport,
-				Link:         link,
-				Duration:     duration,
-				Warmup:       2 * time.Second,
-				MediaStreams: mediaStreams,
-			})
+		for _, loss := range losses {
+			opts.Transport = transport
+			opts.Link.Loss = loss / 100
+			lossLabel := fmt.Sprintf("%g", loss)
+			if opts.ExternalLink {
+				lossLabel = "external"
+			}
+			result, err := loadtest.RunLatency(context.Background(), opts)
 			if err != nil {
-				return fmt.Errorf("%s carrier, %g%% loss: %w", transport, loss, err)
+				return fmt.Errorf("%s carrier, %s%% loss: %w", transport, lossLabel, err)
 			}
 			ms := func(d time.Duration) float64 { return d.Seconds() * 1000 }
-			fmt.Printf("control_latency transport=%s loss_percent=%g media_streams=%d samples=%d unanswered=%d p50_ms=%.1f p99_ms=%.1f p999_ms=%.1f max_ms=%.1f media_mbps=%.1f budget_p99_ms=%.0f within_budget=%t\n",
-				transport, loss, mediaStreams, result.Samples, result.Unanswered,
+			fmt.Printf("control_latency transport=%s loss_percent=%s media_streams=%d samples=%d unanswered=%d p50_ms=%.1f p99_ms=%.1f p999_ms=%.1f max_ms=%.1f media_mbps=%.1f budget_p99_ms=%.0f within_budget=%t\n",
+				transport, lossLabel, opts.MediaStreams, result.Samples, result.Unanswered,
 				ms(result.P50), ms(result.P99), ms(result.P999), ms(result.Max), result.MediaMbps,
 				ms(loadtest.ControlP99Budget), result.Unanswered == 0 && result.P99 <= loadtest.ControlP99Budget)
 		}

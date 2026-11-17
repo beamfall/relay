@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -142,7 +143,7 @@ func deliver(ctx context.Context, queue <-chan scheduled, write func([]byte) err
 // through link. It returns the address to dial instead of upstream. The proxy
 // stops when ctx is done.
 func ProxyTCP(ctx context.Context, upstream string, link Link) (string, error) {
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{Control: smallSocketBuffers}).Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", err
 	}
@@ -164,7 +165,7 @@ func ProxyTCP(ctx context.Context, upstream string, link Link) (string, error) {
 
 func proxyTCPConn(ctx context.Context, down net.Conn, upstream string, link Link) {
 	defer func() { _ = down.Close() }()
-	up, err := (&net.Dialer{}).DialContext(ctx, "tcp", upstream)
+	up, err := (&net.Dialer{Control: smallSocketBuffers}).DialContext(ctx, "tcp", upstream)
 	if err != nil {
 		return
 	}
@@ -305,4 +306,13 @@ func enqueueDatagram(s *shaper, queue chan<- scheduled, datagram []byte) {
 	case queue <- item:
 	default:
 	}
+}
+
+// smallSocketBuffers sizes a proxy socket before it connects or listens. Set
+// afterwards, the receive window negotiated at the handshake stays large.
+func smallSocketBuffers(_, _ string, c syscall.RawConn) error {
+	return c.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, proxySocketBytes)
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, proxySocketBytes)
+	})
 }

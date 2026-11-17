@@ -40,6 +40,13 @@ type LatencyOptions struct {
 	MediaStreams int
 	// ControlInterval is the gap between control messages. Zero uses 5 ms.
 	ControlInterval time.Duration
+	// ExternalLink leaves Link out: the tunnel client dials the relay's carrier
+	// listener directly, for a run whose link is shaped outside the process
+	// (script/netem-latency.sh).
+	ExternalLink bool
+	// CarrierPort fixes the relay's carrier port, TCP and UDP, so an outside
+	// shaper can match it. Zero picks free ports.
+	CarrierPort int
 }
 
 // LatencyResult is the control stream's round-trip latency through the relay:
@@ -98,10 +105,11 @@ func RunLatency(ctx context.Context, opts LatencyOptions) (LatencyResult, error)
 	if err != nil {
 		return LatencyResult{}, err
 	}
+	carrierListen := fmt.Sprintf("127.0.0.1:%d", opts.CarrierPort)
 	node, err := relay.Start(ctx, relay.Config{
 		PublicAddr:  "127.0.0.1:0",
-		CarrierAddr: "127.0.0.1:0",
-		QUICAddr:    "127.0.0.1:0",
+		CarrierAddr: carrierListen,
+		QUICAddr:    carrierListen,
 		AdminAddr:   "127.0.0.1:0",
 		CarrierTLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{relayCert},
@@ -120,15 +128,7 @@ func RunLatency(ctx context.Context, opts LatencyOptions) (LatencyResult, error)
 	}
 	defer node.Close()
 
-	var carrierAddr string
-	switch opts.Transport {
-	case tunnel.TransportTCP:
-		carrierAddr, err = ProxyTCP(ctx, node.CarrierAddr(), opts.Link)
-	case tunnel.TransportQUIC:
-		carrierAddr, err = ProxyUDP(ctx, node.QUICAddr(), opts.Link)
-	default:
-		err = fmt.Errorf("unknown transport %q", opts.Transport)
-	}
+	carrierAddr, err := startLink(ctx, node, opts)
 	if err != nil {
 		return LatencyResult{}, fmt.Errorf("start link: %w", err)
 	}
@@ -217,6 +217,26 @@ func RunLatency(ctx context.Context, opts LatencyOptions) (LatencyResult, error)
 		result.Max = latencies[len(latencies)-1]
 	}
 	return result, nil
+}
+
+// startLink returns the address the tunnel client dials: the emulated link in
+// front of the relay's carrier listener, or the listener itself when the link
+// is external.
+func startLink(ctx context.Context, node *relay.Server, opts LatencyOptions) (string, error) {
+	switch opts.Transport {
+	case tunnel.TransportTCP:
+		if opts.ExternalLink {
+			return node.CarrierAddr(), nil
+		}
+		return ProxyTCP(ctx, node.CarrierAddr(), opts.Link)
+	case tunnel.TransportQUIC:
+		if opts.ExternalLink {
+			return node.QUICAddr(), nil
+		}
+		return ProxyUDP(ctx, node.QUICAddr(), opts.Link)
+	default:
+		return "", fmt.Errorf("unknown transport %q", opts.Transport)
+	}
 }
 
 // measureControl sends a timestamped message every ControlInterval and reads

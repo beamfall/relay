@@ -1,13 +1,15 @@
 # Relay latency budget for established streams
 
-Ticket: CORE-2246. Scope: the latency the relay and its carrier add to a stream that is already
+Tickets: CORE-2246 (budget), CORE-2262 (TCP carrier). Scope: the latency the relay and its carrier add to a stream that is already
 open, as opposed to tunnel setup (`beamfall_relay_tunnel_setup_seconds`). The case that matters is
 a small control stream (playback sync signals, clock exchanges) sharing a carrier with media.
 
 ## The budget
 
 **A control stream's round-trip p99 stays at or below 250 ms while a media stream saturates the
-same carrier in both directions**, on the reference link, with and without 1% packet loss.
+same carrier in both directions**, on the reference link, with and without 1% packet loss. QUIC
+meets it. The default TLS/TCP carrier meets it without loss and misses it with real 1% loss (see
+the decision below).
 
 - Reference link: 20 Mbit/s each way, 10 ms one-way delay (20 ms round trip), 50 ms bottleneck
   queue. It sits between the tunnel client and the relay's carrier listener.
@@ -20,50 +22,134 @@ detector, so the budget keeps a little over twice the worst measured value as he
 hosts. It is a regression ceiling taken from measurement, not a product requirement: if playback
 sync needs a tighter figure, lower it here and in `loadtest.ControlP99Budget`.
 
-`TestControlStreamLatencyBudget` (`internal/loadtest`) fails when the QUIC carrier exceeds the
-budget. It runs in `make gate` and is skipped under `-short`. The constants are
-`loadtest.ControlP99Budget` and `loadtest.ReferenceLink`.
+`TestControlStreamLatencyBudget` (`internal/loadtest`) fails when a carrier exceeds the budget. It
+holds the QUIC carrier on every host and the TLS/TCP carrier on Linux (why not macOS: see
+[the macOS harness](#the-macos-harness-and-the-tcp-carrier)). It runs in `make gate` and is skipped
+under `-short`. The constants are `loadtest.ControlP99Budget` and `loadtest.ReferenceLink`.
 
-**The default TLS/TCP carrier does not meet the budget** and the test does not hold it to one. See
-the numbers and the recommendation below.
+## Decision for 1.0 (CORE-2262)
+
+**TLS/TCP stays the default carrier, and each end bounds the carrier socket's unsent send backlog
+to 16 KiB** (`protocol.CarrierUnsentLowat`). Before this the TCP carrier measured 0.5 to 1.0 s at
+p99; with it the carrier is inside the budget on the reference link without loss, and with the
+harness's modelled loss. **With real 1% packet loss it is not**: 353 ms at p99 through `tc`/netem,
+down from 1.57 s. What remains there is TCP's own loss recovery holding every stream behind a lost
+segment, which no send-side setting removes. QUIC stays inside the budget in every case measured.
+
+The options not taken for 1.0:
+
+- **QUIC as the default, TCP as the fallback.** Still the better carrier for this traffic, and the
+  only one that meets the budget under real loss. It needs the QUIC listener exposed on hosted
+  relays, a client fallback when UDP is blocked, and core's tunnel client changed in step.
+- **Control streams on a second carrier connection.** The relay forwards opaque TLS and cannot tell
+  a control stream from media, so this needs a protocol change at both ends.
+- **A smaller send buffer** (`SO_SNDBUF`). It caps bytes in flight as well as unsent bytes, so it
+  limits throughput to one buffer per round trip.
+
+How the bound works: on Linux `TCP_NOTSENT_LOWAT` makes the kernel refuse a write while 16 KiB is
+unsent, so the writer waits. macOS applies that option only to writability events, so there each
+write first waits until the send buffer holds no more than 16 KiB beyond what the congestion and
+peer windows allow in flight (`TCP_CONNECTION_INFO`, polled every millisecond). Neither limits
+bytes in flight, so throughput is unchanged (media moved 40.4 Mbit/s before and after). A 4 KiB
+bound measured the same as 16 KiB.
+
+Limits of what ships:
+
+- The relay bounds its own carrier sockets, and so does this repository's tunnel client. **Core's
+  home server uses its own tunnel client**, which sends the media, and it does not have the bound
+  yet. Until it does, only the relay-to-home direction is bounded in production.
+- Windows has no bound.
 
 ## Measurements
 
-`go run ./cmd/relay-loadgen -mode latency -duration 20s`, Apple M2 Max, macOS, Go 1.27.4,
-2026-11-17. Round-trip latency of the control stream, milliseconds.
+Round-trip latency of the control stream in milliseconds, one saturating media stream, 20 s runs,
+Go 1.27.4, 2026-11-17. "Before" is the carrier without the bound.
+
+### Linux, real `tc`/netem link
+
+`script/netem-latency.sh` on WSL2 (kernel 6.18.33.2-microsoft-standard-WSL2, 32 cores). The
+loadgen dials the relay's carrier port directly; netem shapes that port in a private network
+namespace, each direction separately: 20 Mbit/s, 10 ms delay, 83-packet (50 ms) queue, loopback
+MTU 1500 with segmentation offload off. Loss here is real packet loss for both carriers.
+
+| Carrier | Loss | | p50 | p99 | p99.9 | max | Media moved (both ways) |
+|---|---|---|---|---|---|---|---|
+| TCP + yamux | 0% | before | 726.5 | 983.2 | 1149.3 | 1169.5 | 36.6 Mbit/s |
+| TCP + yamux | 0% | bounded | 119.5 | 158.8 | 168.6 | 172.6 | 35.9 Mbit/s |
+| TCP + yamux | 1% | before | 1001.8 | 1570.8 | 1717.1 | 1732.7 | 14.8 Mbit/s |
+| TCP + yamux | 1% | bounded | 169.7 | **352.8** | 452.5 | 472.6 | 13.7 Mbit/s |
+| QUIC | 0% | | 102.1 | 161.7 | 226.4 | 236.4 | 36.0 Mbit/s |
+| QUIC | 1% | | 33.1 | 65.7 | 75.3 | 78.6 | 21.1 Mbit/s |
+
+Two more bounded runs with 1% loss gave a TCP p99 of 349.9 and 327.8 ms. This is one host and a
+virtualised kernel; treat the figures as indicative.
+
+### Linux, in-process link
+
+`relay-loadgen -mode latency -duration 20s` on the same host. This is the configuration the test
+holds.
+
+| Carrier | Loss | | p50 | p99 | p99.9 | max | Media moved (both ways) |
+|---|---|---|---|---|---|---|---|
+| TCP + yamux | 0% | before | 492.9 | 580.6 | 628.6 | 639.1 | 41.4 Mbit/s |
+| TCP + yamux | 0% | bounded | 160.8 | 178.8 | 184.2 | 189.2 | 40.4 Mbit/s |
+| TCP + yamux | 1% (modelled) | before | 399.2 | 474.3 | 506.8 | 516.6 | 41.6 Mbit/s |
+| TCP + yamux | 1% (modelled) | bounded | 165.6 | 197.3 | 208.6 | 219.5 | 40.7 Mbit/s |
+| QUIC | 0% | | 66.8 | 117.4 | 148.9 | 154.1 | 37.7 Mbit/s |
+| QUIC | 1% | | 30.7 | 62.2 | 69.1 | 73.2 | 17.4 Mbit/s |
+
+### macOS, in-process link
+
+Apple M2 Max. The "before" and idle rows are the CORE-2246 runs.
 
 | Carrier | Loss | Media | p50 | p99 | p99.9 | max | Media moved (both ways) |
 |---|---|---|---|---|---|---|---|
-| TCP + yamux | 0% | saturating | 743.5 | 810.5 | 878.7 | 886.6 | 40.6 Mbit/s |
-| TCP + yamux | 1% | saturating | 743.7 | 881.2 | 896.0 | 905.7 | 40.6 Mbit/s |
-| QUIC | 0% | saturating | 67.7 | 93.3 | 140.5 | 148.2 | 36.6 Mbit/s |
-| QUIC | 1% | saturating | 30.8 | 64.3 | 77.0 | 81.9 | 17.6 Mbit/s |
+| TCP + yamux | 0% | saturating, before | 743.5 | 810.5 | 878.7 | 886.6 | 40.6 Mbit/s |
+| TCP + yamux | 0% | saturating, bounded | 475.9 | 530.2 | 538.0 | 545.1 | 40.4 Mbit/s |
+| TCP + yamux | 1% (modelled) | saturating, before | 743.7 | 881.2 | 896.0 | 905.7 | 40.6 Mbit/s |
+| TCP + yamux | 1% (modelled) | saturating, bounded | 504.0 | 614.6 | 647.7 | 657.7 | 40.4 Mbit/s |
+| QUIC | 0% | saturating | 68.4 | 79.4 | 139.5 | 149.5 | 36.3 Mbit/s |
+| QUIC | 1% | saturating | 28.9 | 58.9 | 74.9 | 85.5 | 18.8 Mbit/s |
 | TCP + yamux | 0% | none | 20.8 | 36.7 | 53.5 | 57.9 | |
-| TCP + yamux | 1% | none | 20.5 | 40.5 | 41.0 | 41.9 | |
+| TCP + yamux | 1% (modelled) | none | 20.5 | 40.5 | 41.0 | 41.9 | |
 | QUIC | 0% | none | 20.6 | 21.7 | 22.7 | 22.9 | |
 | QUIC | 1% | none | 20.6 | 46.1 | 61.2 | 70.9 | |
 
 The idle rows (`-media-streams 0 -duration 10s`) are the floor: the link's 20 ms round trip.
 
-What the numbers say:
+### The macOS harness and the TCP carrier
 
-- On the TCP carrier a control message waits about 370 ms in each direction behind media. yamux
-  frames every stream onto one TCP connection in arrival order, and the kernel's send buffer for
-  that connection already holds media bytes, so a control frame cannot overtake them. The delay is
-  the buffered media divided by the link rate: it grows as the uplink gets slower and with the
-  host's send-buffer autotuning (4 MiB ceiling on this host). One earlier run on the same host,
-  with larger proxy socket buffers, measured a 1.59 s p99.
-- On the QUIC carrier each stream is scheduled separately, so the control stream waits only for
-  the link queue (50 ms here) and never behind buffered media.
-- 1% loss barely moves TCP in this harness because the queueing delay dominates and the loss model
-  is kind to TCP (below). On QUIC, loss lowers control latency because the congestion controller
-  backs off and the link queue stays short, at the cost of media throughput (17.6 against
-  36.6 Mbit/s).
+The macOS TCP rows stay over the budget because of the harness, not the carrier. The emulated
+link's proxy asks for 16 KiB socket buffers so that its only queue is the configured 50 ms. macOS
+loopback does not honour that for the receive side: with the bound in place the carrier's own send
+buffer held 16 to 100 KB, while the proxy's receive socket held 300 to 530 KB of unread carrier
+bytes, about 200 ms at the link rate in each direction. Setting the buffer on the listener, on the
+accepted socket, or again before each read did not change it. That queue does not exist on a real
+link, so the macOS TCP rows overstate the carrier's latency and the test holds the TCP carrier on
+Linux only. The macOS write path has its own test
+(`TestBoundUnsentBacklogHoldsWriter`), which shows the writer is held; it has not been measured
+end to end on a real link from a Mac.
+
+### What the numbers say
+
+- Unbounded, a control message on the TCP carrier waits behind media the kernel has accepted but
+  not sent. yamux frames every stream onto one TCP connection in arrival order, so a control frame
+  cannot overtake those bytes. The wait is the buffered media divided by the link rate, so it grows
+  as the uplink gets slower and with send-buffer autotuning.
+- Bounded, what is left ahead of a control frame is the 16 KiB, the rest of the media frame being
+  written (up to 32 KiB) and the link queue.
+- Under real loss TCP delivers nothing behind a lost segment until it is retransmitted, and a lost
+  retransmission waits for a timeout. That is the 353 ms p99, and it applies to every stream on the
+  carrier. The in-process loss model leaves out the timeout and the congestion-window cut (below),
+  which is why its 1% row is inside the budget and the netem row is not.
+- On the QUIC carrier each stream is scheduled and recovered separately, so the control stream
+  waits only for the link queue. Loss lowers its latency because the congestion controller backs
+  off and the queue stays short, at the cost of media throughput.
 
 ## How loss is injected
 
 Real packet loss cannot be injected portably: Linux needs `tc`/netem and root
-(`script/netem-soak.sh`), and macOS has no netem. The harness instead puts an in-process proxy,
+(`script/netem-latency.sh`, above), and macOS has no netem. The in-process harness instead puts a proxy,
 `loadtest.Link`, between the tunnel client and the relay. Neither end is modified.
 
 - **QUIC: real loss.** The UDP proxy drops each datagram with the configured probability and
@@ -71,11 +157,11 @@ Real packet loss cannot be injected portably: Linux needs `tc`/netem and root
 - **TCP: modelled loss.** A TCP stream cannot lose bytes, so the proxy models what loss does to
   it: a lost segment and everything behind it on the connection is held for one round trip, the
   time a fast retransmit takes. There is no congestion-window cut and no retransmission timeout,
-  so the TCP rows under loss are a best case. Real 1% loss would be worse for TCP, not better.
+  so the TCP rows under loss are a best case. The netem table shows the real figure.
 
-The proxy's own sockets are kept at 16 KiB so the bottleneck buffer is the configured queue. The
-relay's and tunnel client's send buffers are left at the system defaults, because that is what
-ships.
+The proxy's own sockets ask for 16 KiB buffers so the bottleneck buffer is the configured queue
+(macOS does not honour this, above). The relay's and tunnel client's send buffers are left at the
+system defaults, because that is what ships.
 
 ## Relay metrics
 
@@ -91,14 +177,7 @@ the payload. These histograms see time spent blocked on a write, which is where 
 shows up. They cannot see time a chunk spent in a kernel or carrier buffer before the relay read
 it, so the end-to-end figure comes from the loadgen run above, not from these series alone.
 
-## Recommendation on the default carrier
+## After 1.0
 
-Make QUIC the default carrier for servers that carry control traffic next to media, with TLS/TCP
-as the fallback when UDP is blocked. On the same link the QUIC carrier's control p99 is about a
-ninth of the TCP carrier's (93 against 811 ms), and it is the only one inside the budget.
-
-The default is not changed here. Switching it needs the QUIC listener exposed on hosted relays, a
-client fallback to TCP when UDP does not get through, and core's tunnel client changed in step,
-none of which is a one-line switch. Two smaller options would narrow the gap on the TCP carrier
-and are worth a ticket each: cap the carrier socket's unsent backlog (`TCP_NOTSENT_LOWAT` or a
-smaller send buffer), or carry control streams on a second carrier connection.
+Making QUIC the default carrier, with TLS/TCP as the fallback when UDP is blocked, is still the
+way to meet the budget on a lossy link. It is not scheduled for 1.0 (see the decision above).

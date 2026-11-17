@@ -379,7 +379,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	readiness := &relayReadinessState{}
 	s := &Server{
 		publicListener:         publicListener,
-		carrierListener:        tls.NewListener(carrierTCP, cfg.CarrierTLSConfig),
+		carrierListener:        tls.NewListener(protocol.UnsentBacklogListener(carrierTCP), cfg.CarrierTLSConfig),
 		quicListener:           quicListener,
 		registry:               newRegistry(),
 		cacheKeys:              newCacheKeyRegistry(),

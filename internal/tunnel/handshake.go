@@ -213,7 +213,7 @@ func (c *Client) dialTCP(ctx context.Context, attempt *carrierAttempt, token []b
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect relay carrier: %w", err)
 	}
-	conn := &onceConn{Conn: raw}
+	conn := &onceConn{Conn: protocol.BoundUnsentBacklog(raw)}
 	if dialContextErr != nil || ctx.Err() != nil {
 		_ = conn.Close()
 		return nil, nil, fmt.Errorf("connect relay carrier: %w", firstContextError(dialContextErr, ctx.Err()))
