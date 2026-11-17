@@ -31,7 +31,7 @@ COPY --from=build /out/tunnel-client /usr/local/bin/tunnel-client
 COPY --from=build /out/relay-healthcheck /usr/local/bin/relay-healthcheck
 COPY --from=build --chown=nonroot:nonroot --chmod=0700 /out/relayd-state /var/lib/beamfall-relay
 
-EXPOSE 8443 9443 9080
+EXPOSE 8443 9443 9443/udp 9080
 VOLUME ["/var/lib/beamfall-relay"]
 USER nonroot:nonroot
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["/usr/local/bin/relay-healthcheck"]

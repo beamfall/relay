@@ -4,9 +4,9 @@
 
 With the default carrier transport the tunnel client SHALL first try the QUIC carrier at the relay
 address and, when that attempt fails without an answer from the relay within 3 seconds, SHALL
-connect over TLS/TCP in the same attempt using a newly obtained token. After a fallback it SHALL
-NOT try QUIC again for 10 minutes. An explicitly configured `tcp` or `quic` transport SHALL use
-only that transport.
+connect over TLS/TCP in the same attempt using a newly obtained token. After a fallback that
+connected it SHALL NOT try QUIC again for 10 minutes. An explicitly configured `tcp` or `quic`
+transport SHALL use only that transport.
 
 #### Scenario: Relay reachable over UDP
 
@@ -25,8 +25,13 @@ only that transport.
 
 #### Scenario: Relay refuses the carrier over QUIC
 
-- **WHEN** the relay answers the QUIC registration with a refusal
-- **THEN** the attempt fails with that refusal and TLS/TCP is not tried
+- **WHEN** the relay answers the QUIC registration with a refusal frame or by closing the connection
+- **THEN** the attempt fails with that answer, TLS/TCP is not tried and QUIC is not held off
+
+#### Scenario: Neither transport connects
+
+- **WHEN** the QUIC attempt gets no answer and the TLS/TCP attempt fails too
+- **THEN** the next attempt tries QUIC first
 
 ### Requirement: The relay accepts QUIC carriers by default
 
@@ -38,6 +43,11 @@ setting is `off`.
 
 - **WHEN** `relayd` starts with no QUIC carrier address configured
 - **THEN** its QUIC carrier address is its carrier address
+
+#### Scenario: Unverified source address
+
+- **WHEN** a QUIC packet opens a new connection to the carrier listener
+- **THEN** the relay answers with a Retry and starts the TLS handshake only after the source address returns its token
 
 #### Scenario: Disabled
 

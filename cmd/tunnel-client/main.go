@@ -33,8 +33,8 @@ func main() {
 		tokenTTL               = flag.Duration("token-ttl", tokenTTLDefault, "hmac token mode only: validity window of each minted v2 tunnel token. The client proactively establishes a fresh carrier halfway through this window while the old carrier drains")
 		caFile                 = flag.String("relay-ca", os.Getenv("TUNNEL_RELAY_CA"), "relay carrier CA PEM file")
 		insecureTest           = flag.Bool("insecure-skip-verify", false, "skip relay carrier TLS verification for local tests only")
-		transport              = flag.String("transport", config.EnvOrDefault(os.Getenv("TUNNEL_TRANSPORT"), tunnel.TransportTCP), "carrier wire transport: tcp (v1 yamux) or quic (ADR-0018 v2); --relay-addr must point at the matching relay listener")
-		yamuxStreamWindowBytes = flag.Int("yamux-stream-window-bytes", 0, "v1 (tcp transport) carrier per-stream flow-control window in bytes; 0 uses the 4 MiB default. Must match the relay's --yamux-stream-window-bytes. Ignored for quic transport.")
+		transport              = flag.String("transport", config.EnvOrDefault(os.Getenv("TUNNEL_TRANSPORT"), tunnel.TransportAuto), "carrier wire transport: auto (QUIC first, TLS/TCP when the relay does not answer over UDP), tcp (yamux) or quic (ADR-0018 v2). auto and quic expect the relay's QUIC listener on the --relay-addr port number")
+		yamuxStreamWindowBytes = flag.Int("yamux-stream-window-bytes", 0, "TLS/TCP (yamux) carrier per-stream flow-control window in bytes; 0 uses the 4 MiB default. Must match the relay's --yamux-stream-window-bytes. Ignored for quic transport.")
 	)
 	flag.Parse()
 
@@ -97,11 +97,12 @@ func main() {
 	client.Wait()
 }
 
-// validateYamuxStreamWindow checks --yamux-stream-window-bytes only for the tcp
-// transport, the one that builds a yamux session. The flag is documented as ignored
-// for quic, so a stale value there must not stop the client from starting.
+// validateYamuxStreamWindow checks --yamux-stream-window-bytes for the
+// transports that can build a yamux session (tcp, and auto when it falls back).
+// The flag is documented as ignored for quic, so a stale value there must not
+// stop the client from starting.
 func validateYamuxStreamWindow(transport string, streamWindowBytes int) error {
-	if transport != tunnel.TransportTCP {
+	if transport == tunnel.TransportQUIC {
 		return nil
 	}
 	return protocol.ValidateYamuxStreamWindowBytes(int64(streamWindowBytes))

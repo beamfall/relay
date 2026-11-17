@@ -1,15 +1,15 @@
 # Relay latency budget for established streams
 
-Tickets: CORE-2246 (budget), CORE-2262 (TCP carrier). Scope: the latency the relay and its carrier add to a stream that is already
+Tickets: CORE-2246 (budget), CORE-2262 (TCP carrier), CORE-2283 (QUIC by default). Scope: the latency the relay and its carrier add to a stream that is already
 open, as opposed to tunnel setup (`beamfall_relay_tunnel_setup_seconds`). The case that matters is
 a small control stream (playback sync signals, clock exchanges) sharing a carrier with media.
 
 ## The budget
 
 **A control stream's round-trip p99 stays at or below 250 ms while a media stream saturates the
-same carrier in both directions**, on the reference link, with and without 1% packet loss. QUIC
-meets it. The default TLS/TCP carrier meets it without loss and misses it with real 1% loss (see
-the decision below).
+same carrier in both directions**, on the reference link, with and without 1% packet loss. QUIC,
+which the default transport uses whenever UDP reaches the relay, meets it. The TLS/TCP carrier it
+falls back to meets it without loss and misses it with real 1% loss (see the decisions below).
 
 - Reference link: 20 Mbit/s each way, 10 ms one-way delay (20 ms round trip), 50 ms bottleneck
   queue. It sits between the tunnel client and the relay's carrier listener.
@@ -27,22 +27,53 @@ holds the QUIC carrier on every host and the TLS/TCP carrier on Linux (why not m
 [the macOS harness](#the-macos-harness-and-the-tcp-carrier)). It runs in `make gate` and is skipped
 under `-short`. The constants are `loadtest.ControlP99Budget` and `loadtest.ReferenceLink`.
 
-## Decision for 1.0 (CORE-2262)
+## Decision: QUIC by default, TLS/TCP as the fallback (CORE-2283)
 
-**TLS/TCP stays the default carrier, and each end bounds the carrier socket's unsent send backlog
-to 16 KiB** (`protocol.CarrierUnsentLowat`). Before this the TCP carrier measured 0.5 to 1.0 s at
+**The default carrier transport is `auto`: QUIC first, TLS/TCP when UDP does not reach the relay.**
+It is the default in this repository's tunnel client and in core's home server client
+(`--relay-transport`). It supersedes the CORE-2262 default below; the 16 KiB bound stays, because it
+is what the fallback runs on.
+
+- **UDP exposure.** `relayd` listens for QUIC on the carrier address by default (`--quic-addr`
+  empty), so the carrier port is open on both TCP and UDP: `9443/tcp` and `9443/udp` in the shipped
+  examples. A hosted relay has to allow that UDP port through its firewall or load balancer; one
+  that does not still works, on the fallback. `--quic-addr off` turns the listener off. A QUIC
+  carrier presents the same token and registers through the same code as a TCP one, and counts
+  against the same unauthenticated-connection limits and handshake backoff. One difference: the
+  QUIC TLS handshake completes before those apply, where a TCP connection is counted when it is
+  accepted. To keep that from serving spoofed sources, the listener answers every new connection
+  with a QUIC Retry, so it does no TLS work until the source address has echoed a token. That adds
+  one round trip to carrier setup and nothing afterwards. It does not stop a real host from opening
+  handshakes; firewall the UDP port to the home server's address as for TCP.
+- **Fallback.** Each connection attempt gives QUIC 3 s for the dial, handshake and registration.
+  With no answer from the relay in that time the client connects over TLS/TCP in the same attempt,
+  with a newly obtained token (the relay refuses a replayed one). The probe never takes more than
+  half of the time the attempt has left. Once TLS/TCP has connected the client skips QUIC for the
+  next 10 minutes; if TLS/TCP fails too, the relay is down and the next attempt tries QUIC again.
+  An answer from the relay over QUIC is returned as it is, with no fallback: a refusal frame (bad
+  token, hostname in use) or the relay closing the connection, because TCP would get the same
+  answer. The relay keeps a refused QUIC connection open for up to 250 ms so the refusal reaches
+  the client before the close. A relay certificate the client rejects on QUIC is not an answer, so
+  that case falls back and shows only in the client's warning. `tcp` and `quic` can still be set
+  explicitly, and neither falls back. The client logs which transport each connection is on.
+- **What the fallback costs.** A client behind a network that drops UDP waits the 3 s once per
+  10 minutes of reconnecting, and runs on the TCP carrier, which misses the budget under real loss
+  (measured below). A carrier that is up on TCP stays on TCP: the client tries QUIC again only
+  when the carrier next has to be established after the hold-off, not while it is connected.
+- **Not taken: control streams on a second carrier connection.** The relay forwards opaque TLS and
+  cannot tell a control stream from media, so this needs a protocol change at both ends, and it
+  would still leave media on TCP behind every lost segment.
+
+## Decision for the TLS/TCP carrier (CORE-2262)
+
+**Each end bounds the TLS/TCP carrier socket's unsent send backlog to 16 KiB** (`protocol.CarrierUnsentLowat`). Before this the TCP carrier measured 0.5 to 1.0 s at
 p99; with it the carrier is inside the budget on the reference link without loss, and with the
 harness's modelled loss. **With real 1% packet loss it is not**: 353 ms at p99 through `tc`/netem,
 down from 1.57 s. What remains there is TCP's own loss recovery holding every stream behind a lost
 segment, which no send-side setting removes. QUIC stays inside the budget in every case measured.
 
-The options not taken for 1.0:
+Not taken:
 
-- **QUIC as the default, TCP as the fallback.** Still the better carrier for this traffic, and the
-  only one that meets the budget under real loss. It needs the QUIC listener exposed on hosted
-  relays, a client fallback when UDP is blocked, and core's tunnel client changed in step.
-- **Control streams on a second carrier connection.** The relay forwards opaque TLS and cannot tell
-  a control stream from media, so this needs a protocol change at both ends.
 - **A smaller send buffer** (`SO_SNDBUF`). It caps bytes in flight as well as unsent bytes, so it
   limits throughput to one buffer per round trip.
 
@@ -122,10 +153,47 @@ sudo BIN=/tmp/relay-loadgen DURATION=20s \
   script/netem-latency.sh
 ```
 
+Core's client runs on its default transport; put `CARRIER_TRANSPORT=tcp` (or `quic`) in front of
+the command to pin one.
+
 With `CARRIER_CMD` set, the loadgen runs with `-external-carrier-dir`: it starts the relay with a
 one-run HMAC secret, writes that secret (`relay-token`), the carrier CA (`relay-ca.pem`) and the
 addresses (`carrier.env`) into a scratch directory, and waits up to 60 s for the outside carrier
 to register before measuring. `CARRIER_UNBOUNDED=1` in the environment gives the "before" rows.
+
+### Linux, real `tc`/netem link, default carrier configuration (CORE-2283)
+
+The same link and host, with both carriers on one port as `relayd` listens by default and each
+tunnel client left on its default transport: this repository's client, and core's
+(`internal/remoteaccess` at core `83cff287`). "UDP blocked" drops UDP to the carrier port in the
+namespace (`BLOCK_UDP=1`), so the client's QUIC attempt times out and it falls back. The carrier
+column is the transport the client reported. 4000 control messages per run, all echoed.
+
+| Carrier client | Configuration | Carrier | Loss | p50 | p99 | p99.9 | max | Media moved (both ways) |
+|---|---|---|---|---|---|---|---|---|
+| this repository | default | QUIC | 0% | 106.1 | 128.1 | 224.4 | 245.1 | 33.4 Mbit/s |
+| this repository | default | QUIC | 1% | 33.5 | 69.0 | 85.4 | 100.4 | 22.1 Mbit/s |
+| this repository | default | QUIC | 1% | 33.6 | 66.1 | 76.4 | 82.1 | 22.6 Mbit/s |
+| this repository | default | QUIC | 1% | 33.8 | 68.0 | 78.2 | 84.2 | 21.6 Mbit/s |
+| this repository | default, UDP blocked | TLS/TCP | 0% | 118.5 | 159.5 | 168.0 | 178.0 | 35.0 Mbit/s |
+| this repository | default, UDP blocked | TLS/TCP | 1% | 168.6 | **361.5** | 418.3 | 433.1 | 15.2 Mbit/s |
+| core | default | QUIC | 0% | 100.7 | 172.9 | 239.9 | 254.6 | 34.4 Mbit/s |
+| core | default | QUIC | 1% | 33.5 | 66.1 | 91.1 | 101.6 | 21.5 Mbit/s |
+| core | default | QUIC | 1% | 33.3 | 66.3 | 76.3 | 81.0 | 22.4 Mbit/s |
+| core | default | QUIC | 1% | 33.6 | 70.7 | 87.0 | 107.3 | 22.2 Mbit/s |
+| core | default, UDP blocked | TLS/TCP | 0% | 117.5 | 156.8 | 165.2 | 173.6 | 34.9 Mbit/s |
+| core | default, UDP blocked | TLS/TCP | 1% | 171.8 | **365.9** | 431.1 | 450.8 | 14.2 Mbit/s |
+
+On the default configuration the control stream's p99 with real 1% loss is 66 to 71 ms over three
+runs for each client, inside the 250 ms budget. A client that cannot reach the relay over UDP
+connects on TLS/TCP and gets the TCP carrier's figures: inside the budget without loss, over it
+with 1% loss. The UDP-blocked rows are single runs. This is one host and a virtualised kernel;
+treat the figures as indicative.
+
+```sh
+sudo BIN=/tmp/relay-loadgen DURATION=20s TRANSPORTS=auto script/netem-latency.sh
+sudo BIN=/tmp/relay-loadgen DURATION=20s TRANSPORTS=auto BLOCK_UDP=1 script/netem-latency.sh
+```
 
 ### Linux, in-process link
 
@@ -222,7 +290,8 @@ the payload. These histograms see time spent blocked on a write, which is where 
 shows up. They cannot see time a chunk spent in a kernel or carrier buffer before the relay read
 it, so the end-to-end figure comes from the loadgen run above, not from these series alone.
 
-## After 1.0
+## Still open
 
-Making QUIC the default carrier, with TLS/TCP as the fallback when UDP is blocked, is still the
-way to meet the budget on a lossy link. It is not scheduled for 1.0 (see the decision above).
+- A client on the TLS/TCP fallback is over the budget under real loss. Nothing on the TCP carrier
+  fixes that; the remedy is letting UDP through to the relay.
+- Windows has no unsent-backlog bound on the fallback (CORE-2291).

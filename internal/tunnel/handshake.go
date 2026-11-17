@@ -193,11 +193,140 @@ func contextError(ctx context.Context) error {
 	return errTunnelClientClosed
 }
 
-func (c *Client) establishCarrier(ctx context.Context, attempt *carrierAttempt, token []byte, hello helloOptions, cacheCarrier bool) (io.Closer, protocol.Session, error) {
+// errCarrierRejected marks an answer from the relay that refuses the carrier.
+// The automatic transport does not fall back on it: the relay was reached, and
+// the TLS/TCP carrier would be refused for the same reason.
+var errCarrierRejected = errors.New("relay rejected carrier")
+
+// errQUICProbeTimeout is the cancellation cause of an automatic QUIC attempt
+// that ran out of its budget.
+var errQUICProbeTimeout = errors.New("quic carrier attempt timed out")
+
+// tokenRefreshFunc obtains a new carrier token. nil means the token is static.
+type tokenRefreshFunc func(context.Context) ([]byte, error)
+
+// establishCarrier dials and registers the carrier and reports the transport
+// it ended up on. With TransportAuto it tries QUIC first for a short budget and
+// falls back to TLS/TCP (CORE-2283); refresh then supplies the token for the
+// second registration, because the relay refuses a nonce it has seen.
+func (c *Client) establishCarrier(ctx context.Context, attempt *carrierAttempt, token []byte, refresh tokenRefreshFunc, hello helloOptions, cacheCarrier bool) (io.Closer, protocol.Session, string, error) {
 	if c.cfg.Transport == TransportQUIC {
-		return c.dialQUIC(ctx, attempt, token, hello, cacheCarrier)
+		conn, session, err := c.dialQUIC(ctx, attempt, token, hello, cacheCarrier)
+		return conn, session, TransportQUIC, err
 	}
-	return c.dialTCP(ctx, attempt, token, hello, cacheCarrier)
+	// Start turns an unset transport into TransportAuto, so anything else here
+	// is TransportTCP.
+	fellBack := false
+	if c.cfg.Transport == TransportAuto && !c.quicHeldOff() {
+		conn, session, err := c.probeQUIC(ctx, attempt, token, hello, cacheCarrier)
+		if err == nil {
+			return conn, session, TransportQUIC, nil
+		}
+		if ctx.Err() != nil || relayAnsweredOverQUIC(err) {
+			return nil, nil, "", err
+		}
+		c.logger.Warn("quic carrier unavailable, trying TLS/TCP", "relay", c.cfg.RelayAddr, "err", err)
+		fellBack = true
+		if refresh != nil {
+			if token, err = refresh(ctx); err != nil {
+				return nil, nil, "", fmt.Errorf("load tunnel token: %w", err)
+			}
+		}
+	}
+	conn, session, err := c.dialTCP(ctx, attempt, token, hello, cacheCarrier)
+	if err == nil && fellBack {
+		// Only a relay that answers over TLS/TCP shows the QUIC path is what
+		// failed. When neither answers the relay is down, and the next attempt
+		// tries QUIC again.
+		c.logger.Info("carrier connected over TLS/TCP after quic failed", "relay", c.cfg.RelayAddr, "retry_quic_after", c.holdOffQUIC())
+	}
+	return conn, session, TransportTCP, err
+}
+
+// relayAnsweredOverQUIC reports whether a failed QUIC attempt got an answer
+// from the relay: a refusal frame, or the relay closing the connection. The
+// relay closes right after it writes a refusal, and the close can overtake the
+// frame, so both mean the same. TLS/TCP would be refused too.
+func relayAnsweredOverQUIC(err error) bool {
+	if errors.Is(err, errCarrierRejected) {
+		return true
+	}
+	var closed *quic.ApplicationError
+	return errors.As(err, &closed) && closed.Remote
+}
+
+// probeQUIC is one QUIC attempt bounded by the automatic transport's budget.
+// On failure it leaves the attempt as it was before, ready for the TLS/TCP dial.
+func (c *Client) probeQUIC(ctx context.Context, attempt *carrierAttempt, token []byte, hello helloOptions, cacheCarrier bool) (io.Closer, protocol.Session, error) {
+	budget := c.quicProbeBudget
+	if budget <= 0 {
+		budget = autoQUICBudget
+	}
+	// Leave the TLS/TCP fallback at least half of what the attempt has left.
+	if deadline, ok := ctx.Deadline(); ok {
+		if half := time.Until(deadline) / 2; half < budget {
+			budget = half
+		}
+	}
+	// The probe context stays alive after a success: the carrier connection is
+	// closed when it is cancelled, until activateCarrier takes that over. It
+	// ends with the attempt's context.
+	probeCtx, cancel := context.WithCancelCause(ctx)
+	timer := time.AfterFunc(budget, func() { cancel(errQUICProbeTimeout) })
+	conn, session, err := c.dialQUIC(probeCtx, attempt, token, hello, cacheCarrier)
+	if err == nil && timer.Stop() {
+		return conn, session, nil
+	}
+	timer.Stop()
+	timedOut := context.Cause(probeCtx) == errQUICProbeTimeout
+	cancel(nil)
+	c.releaseAttemptConn(attempt, cacheCarrier)
+	if timedOut && !relayAnsweredOverQUIC(err) {
+		err = fmt.Errorf("no answer from the relay over quic within %s", budget)
+	}
+	return nil, nil, err
+}
+
+// releaseAttemptConn closes the connection a failed transport left on the
+// attempt and clears it, so the attempt can own another one.
+func (c *Client) releaseAttemptConn(attempt *carrierAttempt, cacheCarrier bool) {
+	if attempt.stopClose != nil {
+		attempt.stopClose()
+		attempt.stopClose = nil
+	}
+	c.mu.Lock()
+	connSlot := &c.conn
+	if cacheCarrier {
+		connSlot = &c.cacheConn
+	}
+	conn := attempt.conn
+	attempt.conn = nil
+	if conn != nil && *connSlot == conn {
+		*connSlot = nil
+	}
+	c.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func (c *Client) quicHeldOff() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return time.Now().Before(c.quicHeldUntil)
+}
+
+// holdOffQUIC records a failed automatic QUIC attempt and returns how long
+// QUIC is skipped for.
+func (c *Client) holdOffQUIC() time.Duration {
+	holdOff := c.quicHoldOff
+	if holdOff <= 0 {
+		holdOff = autoQUICHoldOff
+	}
+	c.mu.Lock()
+	c.quicHeldUntil = time.Now().Add(holdOff)
+	c.mu.Unlock()
+	return holdOff
 }
 
 func (c *Client) dialTCP(ctx context.Context, attempt *carrierAttempt, token []byte, hello helloOptions, cacheCarrier bool) (io.Closer, protocol.Session, error) {
@@ -516,9 +645,9 @@ func (c *Client) readAck(ctx context.Context, rw protocol.FrameReadWriter) error
 	}
 	if frame.Type != protocol.FrameAck || frame.Ack == nil {
 		if frame.Type == protocol.FrameError && frame.Error != "" {
-			return fmt.Errorf("relay rejected carrier: %s", frame.Error)
+			return fmt.Errorf("%w: %s", errCarrierRejected, frame.Error)
 		}
-		return errors.New("relay rejected carrier: malformed Ack")
+		return fmt.Errorf("%w: malformed Ack", errCarrierRejected)
 	}
 	return nil
 }

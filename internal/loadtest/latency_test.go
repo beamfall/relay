@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -213,18 +214,6 @@ func TestExternalCarrierRegistersFromTheWrittenFiles(t *testing.T) {
 	}
 }
 
-func TestExternalCarrierRefusesQUIC(t *testing.T) {
-	_, err := RunLatency(context.Background(), LatencyOptions{
-		Transport:          tunnel.TransportQUIC,
-		Duration:           time.Millisecond,
-		ExternalLink:       true,
-		ExternalCarrierDir: t.TempDir(),
-	})
-	if err == nil {
-		t.Fatal("an external carrier on the QUIC transport was accepted")
-	}
-}
-
 // runFileCarrier stands in for the outside client: it waits for carrier.env,
 // then registers with a token minted from the secret file, verifying the relay
 // against the written certificate.
@@ -277,4 +266,47 @@ func runFileCarrier(ctx context.Context, dir string) error {
 	<-ctx.Done()
 	client.Close()
 	return nil
+}
+
+// TestAutoTransportReachesQUICAtTheCarrierAddress runs the tunnel client's
+// default configuration against a relay with both carriers on one port, as
+// relayd listens by default (CORE-2283).
+func TestAutoTransportReachesQUICAtTheCarrierAddress(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	result, err := RunLatency(context.Background(), LatencyOptions{
+		Transport:    tunnel.TransportAuto,
+		Duration:     300 * time.Millisecond,
+		ExternalLink: true,
+		CarrierPort:  port,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CarrierTransport != tunnel.TransportQUIC {
+		t.Fatalf("carrier transport = %q, want %q", result.CarrierTransport, tunnel.TransportQUIC)
+	}
+	if result.Samples == 0 || result.Unanswered > 0 {
+		t.Fatalf("samples=%d unanswered=%d", result.Samples, result.Unanswered)
+	}
+
+	// The netem script measures every transport in one process on one port, so
+	// the next run must get the UDP port the last one is still giving back.
+	if _, err := RunLatency(context.Background(), LatencyOptions{
+		Transport:    tunnel.TransportAuto,
+		Duration:     50 * time.Millisecond,
+		ExternalLink: true,
+		CarrierPort:  port,
+	}); err != nil {
+		t.Fatalf("second run on the same carrier port: %v", err)
+	}
+
+	if _, err := RunLatency(context.Background(), LatencyOptions{Transport: tunnel.TransportAuto, Duration: time.Millisecond}); err == nil {
+		t.Fatal("auto transport accepted an emulated link")
+	}
 }

@@ -220,6 +220,10 @@ func TestYamuxStreamWindowValidatedOnlyForTCP(t *testing.T) {
 	if err := validateYamuxStreamWindow(tunnel.TransportTCP, 0); err != nil {
 		t.Fatalf("tcp transport refused the default window: %v", err)
 	}
+	// The default transport can end up on TLS/TCP, so it is checked too.
+	if err := validateYamuxStreamWindow(tunnel.TransportAuto, 65536); err == nil {
+		t.Fatal("auto transport accepted a 64 KiB window below the yamux minimum")
+	}
 	if err := validateYamuxStreamWindow(tunnel.TransportQUIC, 65536); err != nil {
 		t.Fatalf("quic transport refused an ignored yamux window: %v", err)
 	}

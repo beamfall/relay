@@ -98,7 +98,7 @@ func main() {
 	var (
 		publicAddr               = flag.String("public-addr", config.EnvOrDefault(os.Getenv("RELAYD_PUBLIC_ADDR"), ":8443"), "public TLS passthrough listener address")
 		carrierAddr              = flag.String("carrier-addr", config.EnvOrDefault(os.Getenv("RELAYD_CARRIER_ADDR"), ":9443"), "carrier TLS listener address")
-		quicAddr                 = flag.String("quic-addr", os.Getenv("RELAYD_QUIC_ADDR"), "ADR-0018 v2 QUIC carrier listener address (UDP); empty disables it")
+		quicAddr                 = flag.String("quic-addr", os.Getenv("RELAYD_QUIC_ADDR"), "ADR-0018 v2 QUIC carrier listener address (UDP); empty uses --carrier-addr (the same port number), \"off\" disables it")
 		adminAddr                = flag.String("admin-addr", config.EnvOrDefault(os.Getenv("RELAYD_ADMIN_ADDR"), "127.0.0.1:9080"), "localhost admin listener address")
 		adminAllowPublic         = flag.Bool("admin-allow-public", adminAllowPublicDefault, "explicitly allow --admin-addr to bind a non-loopback, non-private address; without this a public admin bind refuses to start")
 		adminMetricsTokenFile    = flag.String("admin-metrics-token-file", os.Getenv("RELAYD_ADMIN_METRICS_TOKEN_FILE"), "file holding the bearer credential that guards /metrics when --admin-addr is non-loopback (ADR-0146 §5); also read from RELAYD_ADMIN_METRICS_TOKEN. A non-loopback admin bind refuses to start without it")
@@ -187,7 +187,7 @@ func main() {
 		tokenMode:                *tokenMode,
 		tokenVerifier:            tokenVerifier,
 		carrierAddr:              *carrierAddr,
-		quicAddr:                 *quicAddr,
+		quicAddr:                 resolveQUICAddr(*quicAddr, *carrierAddr),
 		adminAddr:                *adminAddr,
 		adminAllowPublic:         *adminAllowPublic,
 		adminMetricsToken:        string(adminMetricsToken),
@@ -579,6 +579,23 @@ func buildTokenVerifier(mode string, token []byte, hosts []string, nonceStorePat
 		CarrierID: "static",
 		Hostnames: hosts,
 	}, nil
+}
+
+// quicAddrOff is the --quic-addr value that disables the QUIC carrier listener.
+const quicAddrOff = "off"
+
+// resolveQUICAddr applies the --quic-addr default (CORE-2283): tunnel clients
+// try QUIC first on the carrier address's port number, so the QUIC listener
+// defaults to the carrier address and is disabled only by "off".
+func resolveQUICAddr(quicAddr, carrierAddr string) string {
+	switch quicAddr {
+	case "":
+		return carrierAddr
+	case quicAddrOff:
+		return ""
+	default:
+		return quicAddr
+	}
 }
 
 // buildRelayConfig maps resolved relayd flags to relay.Config. Connection caps

@@ -367,7 +367,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		if len(quicTLSConfig.NextProtos) == 0 {
 			quicTLSConfig.NextProtos = []string{"beamfall-relay-carrier/1"}
 		}
-		quicListener, err = quic.ListenAddr(cfg.QUICAddr, quicTLSConfig, protocol.QUICConfig())
+		quicListener, err = listenQUICCarrier(cfg.QUICAddr, quicTLSConfig)
 		if err != nil {
 			publicListener.Close() //nolint:errcheck // best-effort cleanup after QUIC listen failure.
 			carrierTCP.Close()     //nolint:errcheck // best-effort cleanup after QUIC listen failure.
@@ -942,6 +942,66 @@ func nextAcceptRetryDelay(delay time.Duration) time.Duration {
 	return delay
 }
 
+// quicRefusalLinger is how long a refused QUIC carrier stays open so the
+// client can read the refusal before the connection close reaches it.
+const quicRefusalLinger = 250 * time.Millisecond
+
+// lingerQUICRefusal finishes the handshake stream after a refusal frame and
+// waits for the client to close. A connection close discards stream data the
+// client has not read yet, and a client that never sees the refusal treats the
+// relay as unreachable over QUIC and falls back to TLS/TCP (CORE-2283).
+func lingerQUICRefusal(conn *quic.Conn, hsStream *quic.Stream) {
+	_ = hsStream.Close()
+	timer := time.NewTimer(quicRefusalLinger)
+	defer timer.Stop()
+	select {
+	case <-conn.Context().Done():
+	case <-timer.C:
+	}
+}
+
+// quicCarrierListener is the QUIC carrier listener with the transport and UDP
+// socket it owns.
+type quicCarrierListener struct {
+	*quic.Listener
+	transport *quic.Transport
+	socket    net.PacketConn
+}
+
+func (l *quicCarrierListener) Close() error {
+	err := l.Listener.Close()
+	_ = l.transport.Close()
+	_ = l.socket.Close()
+	return err
+}
+
+// listenQUICCarrier listens for QUIC carriers on addr. Every new connection is
+// sent a Retry first, so the relay does no TLS work for a source address that
+// cannot receive packets: a spoofed flood costs one small stateless reply per
+// packet, as a SYN does on the TLS/TCP carrier. It adds one round trip to
+// carrier setup.
+func listenQUICCarrier(addr string, tlsConfig *tls.Config) (quicListener, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	socket, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return nil, err
+	}
+	transport := &quic.Transport{
+		Conn:                socket,
+		VerifySourceAddress: func(net.Addr) bool { return true },
+	}
+	listener, err := transport.Listen(tlsConfig, protocol.QUICConfig())
+	if err != nil {
+		_ = transport.Close()
+		_ = socket.Close()
+		return nil, err
+	}
+	return &quicCarrierListener{Listener: listener, transport: transport, socket: socket}, nil
+}
+
 func (s *Server) handleQUICCarrierConn(ctx context.Context, conn *quic.Conn, endPending func()) {
 	defer conn.CloseWithError(0, "") //nolint:errcheck // carrier connection cleanup.
 	// The handshake Hello/Ack exchange happens on the first stream the client
@@ -971,10 +1031,13 @@ func (s *Server) handleQUICCarrierConn(ctx context.Context, conn *quic.Conn, end
 		_ = hsStream.SetReadDeadline(time.Now().Add(s.carrierHandshakeT))
 	}
 	verified, ok := s.carrierHandshake(ctx, hsStream, conn.RemoteAddr())
-	endPending()
 	if !ok {
+		// Still counted as pending (the caller ends it), so refused sources
+		// cannot pile up lingering connections.
+		lingerQUICRefusal(conn, hsStream)
 		return
 	}
+	endPending()
 	releaseSlot, ok := s.reserveCarrierSlot(hsStream)
 	if !ok {
 		return

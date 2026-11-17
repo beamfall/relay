@@ -16,6 +16,7 @@ import (
 	"net"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -45,7 +46,8 @@ func main() {
 		mediaStreams = flag.Int("media-streams", 1, "latency mode: bulk streams saturating the carrier")
 		externalLink = flag.Bool("external-link", false, "latency mode: no emulated link; the carrier is shaped outside the process (script/netem-latency.sh)")
 		carrierPort  = flag.Int("carrier-port", 0, "latency mode: fixed relay carrier port, TCP and UDP, for an outside shaper to match (0 picks free ports)")
-		carrierDir   = flag.String("external-carrier-dir", "", "latency mode: wait for an outside tunnel client (core's) as the TCP carrier instead of starting this repository's; the files it needs are written to this directory")
+		carrierDir   = flag.String("external-carrier-dir", "", "latency mode: wait for an outside tunnel client (core's) as the carrier instead of starting this repository's; the files it needs are written to this directory")
+		latencyOnly  = flag.String("latency-transports", "", "latency mode: comma-separated carrier transports to run (tcp, quic, auto); empty runs tcp and quic, and with -external-link also auto, the tunnel client's default")
 	)
 	flag.Parse()
 	if *mode == "latency" {
@@ -62,7 +64,7 @@ func main() {
 
 			ExternalCarrierDir: *carrierDir,
 		}
-		if err := runLatency(opts, *lossPercent); err != nil {
+		if err := runLatency(opts, *lossPercent, *latencyOnly); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -209,16 +211,27 @@ func main() {
 // saturates the same carrier, for each carrier with and without loss. The link
 // is emulated in-process (loadtest.Link), so the loss is real packet loss for
 // QUIC and a modelled retransmission stall for TCP. With an external link each
-// carrier runs once and the loss is whatever the outside shaper applies.
-func runLatency(opts loadtest.LatencyOptions, lossPercent float64) error {
+// carrier runs once and the loss is whatever the outside shaper applies; the
+// automatic transport (the tunnel client's default) runs there too, because it
+// needs both carriers at one address.
+func runLatency(opts loadtest.LatencyOptions, lossPercent float64, only string) error {
 	losses := []float64{0, lossPercent}
+	transports := []string{tunnel.TransportTCP, tunnel.TransportQUIC}
 	if opts.ExternalLink {
 		losses = []float64{0}
+		transports = append(transports, tunnel.TransportAuto)
 	}
-	transports := []string{tunnel.TransportTCP, tunnel.TransportQUIC}
+	if only != "" {
+		transports = strings.Split(only, ",")
+	}
 	if opts.ExternalCarrierDir != "" {
-		// One run: the outside client registers once, on the TCP carrier.
-		transports, losses = transports[:1], losses[:1]
+		// One run: the outside client registers once. On an external link
+		// with a fixed port it picks its own transport at the relay's one
+		// carrier address; the emulated link carries TCP only.
+		transports, losses = []string{tunnel.TransportTCP}, losses[:1]
+		if opts.ExternalLink && opts.CarrierPort != 0 {
+			transports[0] = tunnel.TransportAuto
+		}
 	}
 	for _, transport := range transports {
 		for _, loss := range losses {
@@ -233,8 +246,12 @@ func runLatency(opts loadtest.LatencyOptions, lossPercent float64) error {
 				return fmt.Errorf("%s carrier, %s%% loss: %w", transport, lossLabel, err)
 			}
 			ms := func(d time.Duration) float64 { return d.Seconds() * 1000 }
-			fmt.Printf("control_latency transport=%s loss_percent=%s media_streams=%d samples=%d unanswered=%d p50_ms=%.1f p99_ms=%.1f p999_ms=%.1f max_ms=%.1f media_mbps=%.1f budget_p99_ms=%.0f within_budget=%t\n",
-				transport, lossLabel, opts.MediaStreams, result.Samples, result.Unanswered,
+			carrier := result.CarrierTransport
+			if carrier == "" {
+				transport, carrier = "outside-client", "unknown"
+			}
+			fmt.Printf("control_latency transport=%s carrier=%s loss_percent=%s media_streams=%d samples=%d unanswered=%d p50_ms=%.1f p99_ms=%.1f p999_ms=%.1f max_ms=%.1f media_mbps=%.1f budget_p99_ms=%.0f within_budget=%t\n",
+				transport, carrier, lossLabel, opts.MediaStreams, result.Samples, result.Unanswered,
 				ms(result.P50), ms(result.P99), ms(result.P999), ms(result.Max), result.MediaMbps,
 				ms(loadtest.ControlP99Budget), result.Unanswered == 0 && result.P99 <= loadtest.ControlP99Budget)
 		}

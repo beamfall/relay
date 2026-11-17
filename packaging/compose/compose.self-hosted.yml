@@ -23,6 +23,8 @@ services:
       # remedy (or `"iptables": false` in daemon.json plus your own forwarding rules) documented
       # there before doing so.
       - "${RELAYD_CARRIER_BIND:-127.0.0.1}:${RELAYD_CARRIER_PORT:-9443}:9443"
+      # The QUIC carrier, which tunnel clients try first, is the same port over UDP.
+      - "${RELAYD_CARRIER_BIND:-127.0.0.1}:${RELAYD_CARRIER_PORT:-9443}:9443/udp"
       - "127.0.0.1:${RELAYD_ADMIN_PORT:-9080}:9080"
     environment:
       RELAYD_PUBLIC_ADDR: ":8443"

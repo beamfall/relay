@@ -619,3 +619,18 @@ func TestApplyMemoryLimit(t *testing.T) {
 		t.Fatalf("applyMemoryLimit(1 GiB) = %d, want budget plus headroom", limit)
 	}
 }
+
+// TestQUICAddrDefaultsToCarrierAddr covers the --quic-addr default
+// (CORE-2283): tunnel clients try QUIC at the carrier address first.
+func TestQUICAddrDefaultsToCarrierAddr(t *testing.T) {
+	cases := []struct{ quic, carrier, want string }{
+		{"", ":9443", ":9443"},
+		{"off", ":9443", ""},
+		{":9444", ":9443", ":9444"},
+	}
+	for _, tc := range cases {
+		if got := resolveQUICAddr(tc.quic, tc.carrier); got != tc.want {
+			t.Errorf("resolveQUICAddr(%q, %q) = %q, want %q", tc.quic, tc.carrier, got, tc.want)
+		}
+	}
+}

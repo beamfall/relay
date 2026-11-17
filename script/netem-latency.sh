@@ -18,13 +18,18 @@
 #   sudo BIN=/tmp/relay-loadgen script/netem-latency.sh
 #
 # Tunables: DURATION (10s), RATE_MBIT (20), DELAY_MS (10, one way), QUEUE_MS
-# (50), LOSSES ("0 1", percent), PORT (47443).
+# (50), LOSSES ("0 1", percent), PORT (47443), TRANSPORTS (comma-separated tcp,
+# quic, auto; default all three, auto being the tunnel client's default).
+#
+# BLOCK_UDP=1 drops UDP to the carrier port, the network of a client that
+# cannot reach the relay over UDP, and measures the default transport only: it
+# has to fall back to TLS/TCP (CORE-2283).
 #
 # To measure another tunnel client (core's home server client) as the carrier,
 # set CARRIER_CMD to a command that reads $CARRIER_DIR/carrier.env once it
 # appears, registers with the relay and carries until the relay goes away. It
-# runs inside the namespace, once per loss value, TCP carrier only. See
-# docs/relay-latency-budget.md.
+# runs inside the namespace, once per loss value, on whichever carrier that
+# client chooses at the relay's address. See docs/relay-latency-budget.md.
 set -euo pipefail
 
 BIN="${BIN:-}"
@@ -35,6 +40,9 @@ QUEUE_MS="${QUEUE_MS:-50}"
 LOSSES="${LOSSES:-0 1}"
 PORT="${PORT:-47443}"
 CARRIER_CMD="${CARRIER_CMD:-}"
+TRANSPORTS="${TRANSPORTS:-}"
+BLOCK_UDP="${BLOCK_UDP:-0}"
+[ "$BLOCK_UDP" != "1" ] || TRANSPORTS="auto"
 MTU=1500
 
 fail() { echo "netem-latency: $*" >&2; exit 1; }
@@ -81,13 +89,21 @@ shape() {
   tc qdisc add dev lo parent 1:3 handle 30: "${netem[@]}"
   # The port offsets are the same for TCP and UDP, so one pair of filters
   # covers both carriers.
-  tc filter add dev lo parent 1: protocol ip prio 1 u32 match ip dport "$PORT" 0xffff flowid 1:2 \
+  tc filter add dev lo parent 1: protocol ip prio 2 u32 match ip dport "$PORT" 0xffff flowid 1:2 \
     || fail "cannot add the u32 filter (cls_u32 missing?)."
-  tc filter add dev lo parent 1: protocol ip prio 1 u32 match ip sport "$PORT" 0xffff flowid 1:3
+  tc filter add dev lo parent 1: protocol ip prio 2 u32 match ip sport "$PORT" 0xffff flowid 1:3
+  if [ "$BLOCK_UDP" = "1" ]; then
+    # Ahead of the classifiers: UDP to the carrier port never arrives.
+    tc filter add dev lo parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff \
+      match ip dport "$PORT" 0xffff action drop \
+      || fail "cannot add the UDP drop filter (act_gact missing?)."
+  fi
 }
 
 echo "# netem-latency: rate=${RATE_MBIT}mbit delay=${DELAY_MS}ms queue=${QUEUE_MS}ms (${limit} packets) duration=$DURATION port=$PORT"
-echo "# kernel=$(uname -r)"
+echo "# kernel=$(uname -r) transports=${TRANSPORTS:-default} block_udp=$BLOCK_UDP"
+args=(-mode latency -external-link -carrier-port "$PORT" -duration "$DURATION")
+[ -z "$TRANSPORTS" ] || args+=(-latency-transports "$TRANSPORTS")
 for loss in $LOSSES; do
   shape "$loss"
   echo "# netem loss=${loss}%"
@@ -96,12 +112,12 @@ for loss in $LOSSES; do
     CARRIER_DIR="$carrier_dir" sh -c "$CARRIER_CMD" &
     carrier_pid=$!
     rc=0
-    "$BIN" -mode latency -external-link -carrier-port "$PORT" -duration "$DURATION" -external-carrier-dir "$carrier_dir" || rc=$?
+    "$BIN" "${args[@]}" -external-carrier-dir "$carrier_dir" || rc=$?
     wait "$carrier_pid" || echo "# carrier command exited $?" >&2
     rm -rf "$carrier_dir"
     [ "$rc" = "0" ] || exit "$rc"
   else
-    "$BIN" -mode latency -external-link -carrier-port "$PORT" -duration "$DURATION"
+    "$BIN" "${args[@]}"
   fi
   for band in 20 30; do
     tc -s qdisc show dev lo handle "$band:" | sed -n 's/^ *Sent/# band '"$band"': Sent/p'

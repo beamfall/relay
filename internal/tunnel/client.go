@@ -32,6 +32,13 @@ const (
 	// relayed stream its own flow-control window so one stalled or
 	// high-bitrate stream no longer head-of-line-blocks its siblings.
 	TransportQUIC = "quic"
+	// TransportAuto is the default (CORE-2283): QUIC first, and TLS/TCP when
+	// the relay does not answer over QUIC within autoQUICBudget. After a
+	// fallback QUIC is skipped for autoQUICHoldOff.
+	TransportAuto = "auto"
+
+	autoQUICBudget  = 3 * time.Second
+	autoQUICHoldOff = 10 * time.Minute
 )
 
 type Config struct {
@@ -52,12 +59,13 @@ type Config struct {
 	TokenRotationInterval time.Duration
 	// MaxStreams bounds concurrently served inbound relay streams. <=0 uses a default.
 	MaxStreams int
-	// Transport selects the carrier wire transport: TransportTCP (default) or
-	// TransportQUIC. RelayAddr must point at the matching relay listener.
+	// Transport selects the carrier wire transport: TransportAuto (default),
+	// TransportTCP or TransportQUIC. RelayAddr names the relay's carrier
+	// listener; the QUIC listener is expected on the same port number (UDP).
 	Transport string
-	// YamuxStreamWindowBytes overrides the v1 (TransportTCP) carrier's
+	// YamuxStreamWindowBytes overrides the TLS/TCP (yamux) carrier's
 	// per-stream flow-control window. <=0 uses
-	// protocol.DefaultYamuxStreamWindowBytes (4 MiB). Ignored for TransportQUIC.
+	// protocol.DefaultYamuxStreamWindowBytes (4 MiB). Ignored on a QUIC carrier.
 	// MUST match the relay's relay.Config.YamuxStreamWindowBytes, since yamux
 	// requires both ends of a session to agree on window size.
 	YamuxStreamWindowBytes int
@@ -114,6 +122,15 @@ type Client struct {
 	handshakeQUICCarrier carrierQUICHandshakeFunc
 	writeHelloCarrier    carrierHelloFunc
 	readAckCarrier       carrierAckFunc
+
+	// transport is the transport of the most recent passthrough carrier
+	// (guarded by mu).
+	transport string
+
+	// Automatic transport state (guarded by mu) and its test overrides.
+	quicHeldUntil   time.Time
+	quicProbeBudget time.Duration
+	quicHoldOff     time.Duration
 }
 
 type sessionStreams struct {
@@ -209,10 +226,10 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	switch cfg.Transport {
 	case "":
-		cfg.Transport = TransportTCP
-	case TransportTCP, TransportQUIC:
+		cfg.Transport = TransportAuto
+	case TransportAuto, TransportTCP, TransportQUIC:
 	default:
-		return nil, fmt.Errorf("unknown carrier transport %q (want %q or %q)", cfg.Transport, TransportTCP, TransportQUIC)
+		return nil, fmt.Errorf("unknown carrier transport %q (want %q, %q or %q)", cfg.Transport, TransportAuto, TransportTCP, TransportQUIC)
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -255,6 +272,14 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 		close(c.done)
 	}()
 	return c, nil
+}
+
+// Transport reports the transport the passthrough carrier last connected
+// over, TransportQUIC or TransportTCP. It is empty before the first connect.
+func (c *Client) Transport() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.transport
 }
 
 // WaitReady blocks until the client has a live carrier session or ctx is done.
@@ -538,7 +563,7 @@ func (c *Client) serveOnceReady(ctx context.Context, ready func()) (wentLive boo
 	}
 	defer c.abortCarrierAttempt(attempt, false)
 
-	conn, session, err := c.establishCarrier(attemptCtx, attempt, token, passthroughHello(), false)
+	conn, session, transport, err := c.establishCarrier(attemptCtx, attempt, token, tokenRefreshFunc(c.cfg.TokenProvider), passthroughHello(), false)
 	if err != nil {
 		return false, err
 	}
@@ -547,7 +572,10 @@ func (c *Client) serveOnceReady(ctx context.Context, ready func()) (wentLive boo
 		_ = conn.Close()
 		return false, err
 	}
-	c.logger.Info("tunnel connected", "relay", c.cfg.RelayAddr, "backend", c.cfg.BackendAddr, "hosts", c.cfg.Hostnames)
+	c.mu.Lock()
+	c.transport = transport
+	c.mu.Unlock()
+	c.logger.Info("tunnel connected", "relay", c.cfg.RelayAddr, "transport", transport, "backend", c.cfg.BackendAddr, "hosts", c.cfg.Hostnames)
 	if ready != nil {
 		ready()
 	}
@@ -606,7 +634,7 @@ func (c *Client) serveCacheOnce(ctx context.Context) (wentLive bool, err error) 
 	}
 	defer c.abortCarrierAttempt(attempt, true)
 
-	conn, session, err := c.establishCarrier(attemptCtx, attempt, token, c.cacheHello(key), true)
+	conn, session, _, err := c.establishCarrier(attemptCtx, attempt, token, tokenRefreshFunc(c.cfg.CacheTokenProvider), c.cacheHello(key), true)
 	if err != nil {
 		return false, err
 	}

@@ -170,6 +170,7 @@ func TestTokenExpiryTakeoverDrainAllowsInflightStreamToComplete(t *testing.T) {
 
 	var tokenNonce atomic.Uint32
 	client, err := tunnel.Start(ctx, tunnel.Config{
+		Transport:   tunnel.TransportTCP,
 		RelayAddr:   node.CarrierAddr(),
 		BackendAddr: home.Addr(),
 		TokenProvider: func(context.Context) ([]byte, error) {
@@ -240,6 +241,7 @@ func relayGappedStreamAcrossRotation(t *testing.T, maxAge time.Duration) []byte 
 
 	var tokenNonce atomic.Uint32
 	client, err := tunnel.Start(ctx, tunnel.Config{
+		Transport:   tunnel.TransportTCP,
 		RelayAddr:   node.CarrierAddr(),
 		BackendAddr: home.Addr(),
 		TokenProvider: func(context.Context) ([]byte, error) {
@@ -275,6 +277,90 @@ func relayGappedStreamAcrossRotation(t *testing.T, maxAge time.Duration) []byte 
 // TLS/TCP one. Proves the QUIC carrier is wired end-to-end (handshake over a
 // QUIC stream, registry/fair-use/splice code paths all unchanged) rather than
 // merely compiling.
+// TestDefaultTransportFallsBackToTCPWhenQUICIsUnreachable is the client that
+// cannot reach the relay over UDP (CORE-2283): nothing answers QUIC at the
+// carrier address, so the default transport connects over TLS/TCP.
+func TestDefaultTransportFallsBackToTCPWhenQUICIsUnreachable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := startHomeTLSEcho(t, testHost)
+	defer home.Close()
+
+	// startRelay puts the QUIC listener on another port, so UDP at the TCP
+	// carrier's port goes unanswered.
+	node := startRelay(t, ctx, relay.Config{
+		TokenVerifier: relay.StaticTokenVerifier{
+			Token:     []byte("test-token"),
+			CarrierID: "carrier-1",
+			Hostnames: []string{testHost},
+		},
+		StreamCap: 8,
+	})
+	defer node.Close()
+
+	client := startTunnelClientTransport(t, ctx, "", node.CarrierAddr(), home.Addr(), []byte("test-token"), []string{testHost})
+	defer client.Close()
+	if got := client.Transport(); got != tunnel.TransportTCP {
+		t.Fatalf("carrier transport = %q, want %q", got, tunnel.TransportTCP)
+	}
+
+	conn := dialPublicTLS(t, node.PublicAddr(), testHost, home.Roots)
+	defer conn.Close() //nolint:errcheck // test connection cleanup.
+	if _, err := conn.Write([]byte("after-fallback\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || line != "echo:after-fallback\n" {
+		t.Fatalf("echo = %q, %v", line, err)
+	}
+}
+
+// TestDefaultTransportTakesAQUICRefusalAsTheAnswer runs the default transport
+// against the real QUIC listener with a token the relay refuses. The relay
+// closes the connection right after its refusal, and the client must read that
+// as an answer rather than as UDP not reaching the relay (CORE-2283).
+func TestDefaultTransportTakesAQUICRefusalAsTheAnswer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	node := startRelay(t, ctx, relay.Config{
+		TokenVerifier: relay.StaticTokenVerifier{
+			Token:     []byte("test-token"),
+			CarrierID: "carrier-1",
+			Hostnames: []string{testHost},
+		},
+		StreamCap: 8,
+	})
+	defer node.Close()
+
+	var logs syncBuffer
+	client, err := tunnel.Start(ctx, tunnel.Config{
+		// The QUIC listener's address: the default transport probes UDP here.
+		RelayAddr:   node.QUICAddr(),
+		BackendAddr: "127.0.0.1:1",
+		Token:       []byte("wrong-token"),
+		Hostnames:   []string{testHost},
+		TLSConfig:   &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13},
+		Logger:      slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("start tunnel client: %v", err)
+	}
+	defer client.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "reconnecting") {
+		if time.Now().After(deadline) {
+			t.Fatalf("the client never reported the refused carrier; logs:\n%s", logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := logs.String(); strings.Contains(got, "trying TLS/TCP") {
+		t.Fatalf("the client fell back to TLS/TCP after the relay refused it over QUIC; logs:\n%s", got)
+	}
+}
+
 func TestRelayPassesQUICBytesEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -330,6 +416,7 @@ func TestRelayCacheVerificationKeysOverlapThroughTunnelReconnect(t *testing.T) {
 	keys := [][]byte{cacheVerificationKey(1), cacheVerificationKey(2)}
 	var keyCalls int
 	client, err := tunnel.Start(ctx, tunnel.Config{
+		Transport:   tunnel.TransportTCP,
 		RelayAddr:   node.CarrierAddr(),
 		BackendAddr: home.Addr(),
 		Token:       []byte("passthrough-token"),
@@ -389,6 +476,7 @@ func TestRelayPullsCacheMissThroughAuthenticatedCacheCarrier(t *testing.T) {
 	defer node.Close()
 
 	client, err := tunnel.Start(ctx, tunnel.Config{
+		Transport:   tunnel.TransportTCP,
 		RelayAddr:   node.CarrierAddr(),
 		BackendAddr: home.Addr(),
 		Token:       []byte("passthrough-token"),
@@ -448,6 +536,7 @@ func TestRelayPullsCacheMissThroughRequestedAuthenticatedCarrier(t *testing.T) {
 	defer node.Close()
 
 	client1, err := tunnel.Start(ctx, tunnel.Config{
+		Transport:            tunnel.TransportTCP,
 		RelayAddr:            node.CarrierAddr(),
 		BackendAddr:          home.Addr(),
 		Token:                []byte("passthrough-token-1"),
@@ -469,6 +558,7 @@ func TestRelayPullsCacheMissThroughRequestedAuthenticatedCarrier(t *testing.T) {
 	}
 
 	client2, err := tunnel.Start(ctx, tunnel.Config{
+		Transport:            tunnel.TransportTCP,
 		RelayAddr:            node.CarrierAddr(),
 		BackendAddr:          home.Addr(),
 		Token:                []byte("passthrough-token-2"),
@@ -1503,11 +1593,11 @@ func waitCacheTokenAccepted(t *testing.T, ctx context.Context, node *relay.Serve
 
 func startTunnelClient(t *testing.T, ctx context.Context, relayAddr, backendAddr string, token []byte, hostnames []string) *tunnel.Client {
 	t.Helper()
-	return startTunnelClientTransport(t, ctx, "", relayAddr, backendAddr, token, hostnames)
+	return startTunnelClientTransport(t, ctx, tunnel.TransportTCP, relayAddr, backendAddr, token, hostnames)
 }
 
 // startTunnelClientTransport is startTunnelClient with an explicit carrier
-// transport (tunnel.TransportTCP/tunnel.TransportQUIC; "" defaults to TCP), so
+// transport (tunnel.TransportTCP, tunnel.TransportQUIC, or "" for the default, tunnel.TransportAuto), so
 // the same relay carrier tests can be driven over either wire transport.
 func startTunnelClientTransport(t *testing.T, ctx context.Context, transport, relayAddr, backendAddr string, token []byte, hostnames []string) *tunnel.Client {
 	t.Helper()

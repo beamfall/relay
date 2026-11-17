@@ -86,7 +86,7 @@ the Makefile targets, which set those automatically.
 - `make soak STREAMS=8 MBPS=32` — bounded in-process load session (heavy; perf only).
 
 A multi-stage [`Dockerfile`](Dockerfile) builds static `relayd` and `tunnel-client` binaries
-into a distroless nonroot image (entrypoint `relayd`, exposes `8443`, `9443`, `9080`).
+into a distroless nonroot image (entrypoint `relayd`, exposes `8443`, `9443` (TCP and UDP), `9080`).
 Release images are signed with keyless cosign; see the operator guide for the verification
 command before deploying a new digest.
 
@@ -95,7 +95,8 @@ command before deploying a new digest.
 ### relayd
 
 Listens on three surfaces (binary defaults shown): public TLS passthrough `:8443`, carrier
-TLS 1.3 `:9443`, and a localhost admin listener `127.0.0.1:9080` serving `/healthz` and
+TLS 1.3 `:9443` (plus the QUIC carrier on the same port over UDP, which tunnel clients try
+first), and a localhost admin listener `127.0.0.1:9080` serving `/healthz` and
 `/metrics`. Production deployments should expose public traffic on external TCP `443`; if
 home-server egress is restricted to `443`, expose the carrier listener on a separate
 `IP:443`, or behind an ALPN-demux/TCP proxy/NAT endpoint. The public and carrier listeners

@@ -355,6 +355,7 @@ func TestClientUsesTokenProviderForCarrierHello(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client, err := Start(ctx, Config{
+		Transport:   TransportTCP,
 		RelayAddr:   carrier.addr(),
 		BackendAddr: backend.addr(),
 		Token:       []byte("static-token"),
@@ -392,6 +393,7 @@ func TestTokenExpiryTakeoverRotatesCarrierAtHalfTTL(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client, err := Start(ctx, Config{
+		Transport:   TransportTCP,
 		RelayAddr:   carrier.addr(),
 		BackendAddr: backend.addr(),
 		TokenProvider: func(context.Context) ([]byte, error) {
@@ -435,6 +437,7 @@ func TestClientStartsDedicatedCacheCarrier(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client, err := Start(ctx, Config{
+		Transport:   TransportTCP,
 		RelayAddr:   carrier.addr(),
 		BackendAddr: backend.addr(),
 		Token:       []byte("passthrough-token"),
@@ -485,6 +488,7 @@ func TestClientRotatesCacheVerificationKeyOnReconnect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client, err := Start(ctx, Config{
+		Transport:   TransportTCP,
 		RelayAddr:   carrier.addr(),
 		BackendAddr: backend.addr(),
 		Token:       []byte("passthrough-token"),
@@ -545,6 +549,7 @@ func TestClientTokenProviderFailureDoesNotDialCarrier(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	client, err := Start(ctx, Config{
+		Transport:   TransportTCP,
 		RelayAddr:   carrier.addr(),
 		BackendAddr: backend.addr(),
 		TokenProvider: func(context.Context) ([]byte, error) {
@@ -703,6 +708,7 @@ func (b *backendHalfCloser) close()       { _ = b.ln.Close() }
 func startTestClient(t *testing.T, ctx context.Context, relayAddr, backendAddr string) *Client {
 	t.Helper()
 	client, err := Start(ctx, Config{
+		Transport:   TransportTCP,
 		RelayAddr:   relayAddr,
 		BackendAddr: backendAddr,
 		Token:       []byte("test-token"),
@@ -764,6 +770,7 @@ func TestClientRejectsStreamsOverCap(t *testing.T) {
 	defer backend.close()
 
 	client, err := Start(ctx, Config{
+		Transport:   TransportTCP,
 		RelayAddr:   carrier.addr(),
 		BackendAddr: backend.addr(),
 		Token:       []byte("test-token"),

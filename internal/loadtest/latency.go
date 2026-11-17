@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/beamfall/relay/internal/relay"
@@ -31,7 +33,12 @@ import (
 // LatencyOptions configures one latency run: a small control stream measured
 // while media streams saturate the same carrier.
 type LatencyOptions struct {
-	// Transport is tunnel.TransportTCP or tunnel.TransportQUIC.
+	// Transport is tunnel.TransportTCP, tunnel.TransportQUIC or
+	// tunnel.TransportAuto (the tunnel client's default: QUIC first, TLS/TCP if
+	// the relay does not answer). TransportAuto needs ExternalLink and a
+	// CarrierPort, because the client tries both transports at one address.
+	// With ExternalCarrierDir it only names the address handed to the outside
+	// client, which picks its own transport.
 	Transport string
 	// Link is the emulated link between the tunnel client and the relay.
 	Link Link
@@ -54,7 +61,7 @@ type LatencyOptions struct {
 	// ExternalCarrierDir, when set, leaves this repository's tunnel client out:
 	// the run waits for an outside tunnel client (core's) to register as the
 	// home's carrier, and writes what that client needs into the directory. See
-	// writeExternalCarrierFiles. Transport must be tunnel.TransportTCP.
+	// writeExternalCarrierFiles.
 	ExternalCarrierDir string
 }
 
@@ -68,8 +75,11 @@ type LatencyResult struct {
 	Unanswered     int
 	P50, P99, P999 time.Duration
 	Max            time.Duration
-	MediaBytes     int64
-	MediaMbps      float64
+	// CarrierTransport is the transport this repository's tunnel client
+	// connected over. It is empty for an outside carrier.
+	CarrierTransport string
+	MediaBytes       int64
+	MediaMbps        float64
 }
 
 // ControlP99Budget is the latency budget for the control stream: its
@@ -124,9 +134,6 @@ func latencyVerifier(opts LatencyOptions) (relay.TokenVerifier, []byte, error) {
 			CarrierID: "loadgen",
 			Hostnames: []string{latencyHost},
 		}, nil, nil
-	}
-	if opts.Transport != tunnel.TransportTCP {
-		return nil, nil, fmt.Errorf("an external carrier needs the %q transport, got %q", tunnel.TransportTCP, opts.Transport)
 	}
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
@@ -185,7 +192,7 @@ func RunLatency(ctx context.Context, opts LatencyOptions) (LatencyResult, error)
 		return LatencyResult{}, err
 	}
 	carrierListen := fmt.Sprintf("127.0.0.1:%d", opts.CarrierPort)
-	node, err := relay.Start(ctx, relay.Config{
+	node, err := startRelay(ctx, relay.Config{
 		PublicAddr:  "127.0.0.1:0",
 		CarrierAddr: carrierListen,
 		QUICAddr:    carrierListen,
@@ -208,6 +215,7 @@ func RunLatency(ctx context.Context, opts LatencyOptions) (LatencyResult, error)
 		return LatencyResult{}, fmt.Errorf("start link: %w", err)
 	}
 	readyWait := carrierReadyWait
+	carrierTransport := func() string { return "" }
 	if opts.ExternalCarrierDir != "" {
 		if err := writeExternalCarrierFiles(opts.ExternalCarrierDir, carrierAddr, home.Addr().String(), secret, relayCert); err != nil {
 			return LatencyResult{}, fmt.Errorf("write external carrier files: %w", err)
@@ -229,6 +237,7 @@ func RunLatency(ctx context.Context, opts LatencyOptions) (LatencyResult, error)
 			return LatencyResult{}, fmt.Errorf("start tunnel client: %w", err)
 		}
 		defer client.Close()
+		carrierTransport = client.Transport
 	}
 
 	dial := func(kind byte) (net.Conn, error) {
@@ -295,6 +304,8 @@ func RunLatency(ctx context.Context, opts LatencyOptions) (LatencyResult, error)
 		P999:       Percentile(latencies, 0.999),
 		MediaBytes: total,
 		MediaMbps:  float64(total*8) / mediaElapsed.Seconds() / 1e6,
+
+		CarrierTransport: carrierTransport(),
 	}
 	if len(latencies) > 0 {
 		result.Max = latencies[len(latencies)-1]
@@ -317,6 +328,11 @@ func startLink(ctx context.Context, node *relay.Server, opts LatencyOptions) (st
 			return node.QUICAddr(), nil
 		}
 		return ProxyUDP(ctx, node.QUICAddr(), opts.Link)
+	case tunnel.TransportAuto:
+		if !opts.ExternalLink || opts.CarrierPort == 0 {
+			return "", fmt.Errorf("the %q transport needs an external link and a fixed carrier port", tunnel.TransportAuto)
+		}
+		return node.CarrierAddr(), nil
 	default:
 		return "", fmt.Errorf("unknown transport %q", opts.Transport)
 	}
@@ -498,4 +514,22 @@ func selfSignedCert(dnsName string) (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
+}
+
+// startRelay starts the relay, waiting briefly for a fixed carrier port still
+// held by the previous run in this process: a closed QUIC listener gives its
+// UDP socket back only once its connections have ended.
+func startRelay(ctx context.Context, cfg relay.Config) (*relay.Server, error) {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		node, err := relay.Start(ctx, cfg)
+		if err == nil || !errors.Is(err, syscall.EADDRINUSE) || time.Now().After(deadline) {
+			return node, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }

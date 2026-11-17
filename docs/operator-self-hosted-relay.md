@@ -18,7 +18,7 @@ missing row as a doc bug, not a flag to skip.
 | --- | --- | --- | --- |
 | `--public-addr` | `RELAYD_PUBLIC_ADDR` | `:8443` | public TLS passthrough listener address |
 | `--carrier-addr` | `RELAYD_CARRIER_ADDR` | `:9443` | carrier TLS listener address |
-| `--quic-addr` | `RELAYD_QUIC_ADDR` | *(empty; disabled)* | ADR-0018 v2 QUIC carrier listener address (UDP); empty disables it |
+| `--quic-addr` | `RELAYD_QUIC_ADDR` | *(empty; the carrier address)* | ADR-0018 v2 QUIC carrier listener address (UDP). Empty listens on `--carrier-addr`, the same port number over UDP, which is where tunnel clients try QUIC first; `off` disables the listener |
 | `--admin-addr` | `RELAYD_ADMIN_ADDR` | `127.0.0.1:9080` | localhost admin listener address (`/healthz`, `/readyz`, `/metrics`) |
 | `--admin-allow-public` | `RELAYD_ADMIN_ALLOW_PUBLIC` | `false` | explicitly allow `--admin-addr` to bind a non-loopback, non-private address; without this a public admin bind refuses to start |
 | `--admin-metrics-token-file` | `RELAYD_ADMIN_METRICS_TOKEN_FILE` (value form: `RELAYD_ADMIN_METRICS_TOKEN`) | *(empty)* | file holding the bearer credential that guards `/metrics` when `--admin-addr` is non-loopback; a non-loopback admin bind refuses to start without it |
@@ -162,6 +162,23 @@ transport to it explicitly:
   internal `:9443`.
 - Single-IP fallback: keep carrier on `9443/tcp` only when your home-server network allows
   outbound non-443 ports.
+- Carrier over QUIC: tunnel clients try QUIC first, on **the same host and port number as the
+  TLS/TCP carrier, over UDP**, and `relayd` listens there by default. Open or forward that UDP
+  port wherever you open the TCP one (`9443/udp`, or `443/udp` mapped to internal `:9443` when
+  the carrier is on external `443`). If UDP does not reach the relay, a client connects over
+  TLS/TCP after at most 3 seconds and does not try QUIC again for 10 minutes; the relay works,
+  but control messages (playback sync) are delayed more when the home server's uplink loses
+  packets. A carrier that is up on TLS/TCP stays there until it next reconnects. See
+  [the latency budget](relay-latency-budget.md).
+- Upgrading a relay that predates QUIC by default:
+  - `relayd` now fails to start if it cannot bind the QUIC UDP port. Set
+    `RELAYD_QUIC_ADDR=off` if the port is taken or you do not want the listener.
+  - An empty `RELAYD_QUIC_ADDR` used to mean no QUIC listener and now means the carrier
+    address. Use `off` to keep it disabled.
+  - A QUIC listener on another port, such as the older example `RELAYD_QUIC_ADDR=:9444`, is
+    never tried by clients on the default transport: they probe the carrier port, wait the
+    3 seconds and use TLS/TCP. Move it to the carrier port, or set the clients to `quic`
+    only if they are given that address as the relay address.
 - `9080/tcp`: admin listener. Bind to localhost or a private network only.
 
 Do not map both public and carrier listeners to the same external `IP:443` directly; `relayd`
@@ -315,11 +332,17 @@ usefulness automatically, but a compromised **secret** still requires this rotat
 
 ### Carrier Port Firewalling
 
-The carrier port (`9443/tcp`) authenticates carriers by shared token only; treat it as a
-sensitive control plane and do not expose it to the open internet when avoidable.
+The carrier port (`9443/tcp` and, for the QUIC carrier, `9443/udp`) authenticates carriers by
+shared token only; treat it as a sensitive control plane and do not expose it to the open
+internet when avoidable.
 
-- Restrict `9443/tcp` at the host or cloud firewall to the known source IP(s) of your
-  home server(s). Everything else should be dropped before it reaches `relayd`.
+- Restrict `9443/tcp` and `9443/udp` at the host or cloud firewall to the known source IP(s) of
+  your home server(s). Everything else should be dropped before it reaches `relayd`. The QUIC
+  listener carries the same token check, per-source handshake backoff and limits as the TLS/TCP
+  one, but they apply after the QUIC TLS handshake has completed. It answers every new
+  connection with a QUIC Retry, so a spoofed source address costs it no TLS work; a real
+  unfirewalled host can still make it do handshakes. `RELAYD_QUIC_ADDR=off` turns it off if
+  you cannot firewall UDP.
 - If you expose the carrier listener on external `443/tcp`, apply the same source-IP
   firewall rule to that listener or to the TCP proxy/NAT target.
 - Keep the admin port (`9080/tcp`) bound to localhost or a private network only.
@@ -354,6 +377,8 @@ external interface. To expose it, an operator must explicitly opt in, and must p
    # Allow only the known home-server source IP(s) to the carrier port, drop everything else.
    sudo iptables -I DOCKER-USER -p tcp --dport 9443 -s <home-server-ip> -j RETURN
    sudo iptables -I DOCKER-USER -p tcp --dport 9443 -j DROP
+   sudo iptables -I DOCKER-USER -p udp --dport 9443 -s <home-server-ip> -j RETURN
+   sudo iptables -I DOCKER-USER -p udp --dport 9443 -j DROP
    ```
 
    Persist these with your distro's iptables-persistent mechanism; a `DOCKER-USER` rule set
