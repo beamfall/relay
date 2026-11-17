@@ -34,17 +34,21 @@ services:
       RELAYD_TOKEN_MODE: "${RELAYD_TOKEN_MODE:-hmac}"
       RELAYD_HMAC_NONCE_STORE: "${RELAYD_HMAC_NONCE_STORE:-/var/lib/beamfall-relay/hmac-nonces.json}"
       RELAYD_HOSTNAMES: "${RELAYD_HOSTNAMES:?set the comma-separated relay hostnames}"
+      RELAYD_STREAM_MEMORY_BUDGET_BYTES: "${RELAYD_STREAM_MEMORY_BUDGET_BYTES:-335544320}"
+      RELAYD_CLIENT_WRITE_STALL_TIMEOUT: "${RELAYD_CLIENT_WRITE_STALL_TIMEOUT:-5m}"
       RELAYD_FAIR_USE_ENABLED: "${RELAYD_FAIR_USE_ENABLED:-false}"
       RELAYD_FAIR_USE_WINDOW_DAYS: "${RELAYD_FAIR_USE_WINDOW_DAYS:-30}"
       RELAYD_FAIR_USE_SOFT_LIMIT_BYTES: "${RELAYD_FAIR_USE_SOFT_LIMIT_BYTES:-0}"
       RELAYD_FAIR_USE_HARD_LIMIT_BYTES: "${RELAYD_FAIR_USE_HARD_LIMIT_BYTES:-0}"
       RELAYD_FAIR_USE_THROTTLED_MAX_CONNS: "${RELAYD_FAIR_USE_THROTTLED_MAX_CONNS:-4}"
       RELAYD_FAIR_USE_STORE: "${RELAYD_FAIR_USE_STORE:-memory}"
-    # Same rationale and starting values as MemoryMax/LimitNOFILE in
-    # packaging/systemd/beamfall-relayd.service: splice buffers and the default connection caps
-    # bound steady-state memory and fd usage well under these ceilings; raise them together with
-    # RELAYD_MAX_PUBLIC_CONNS/--stream-cap and confirm against real traffic rather than this
-    # unmeasured default.
+    # Same sizing rule and starting values as MemoryMax/LimitNOFILE in
+    # packaging/systemd/beamfall-relayd.service: mem_limit must be at least
+    # RELAYD_STREAM_MEMORY_BUDGET_BYTES (default 320 MiB) plus 128 MiB of headroom. The budget
+    # covers the carrier stream window (4 MiB yamux, 8 MiB QUIC) that each stream can hold for a
+    # client that stops reading; relayd carries at most budget / per-stream cost streams (40 at
+    # the defaults). Raise the budget and mem_limit together to carry more streams, raise
+    # mem_limit with RELAYD_MAX_PUBLIC_CONNS, and confirm against real traffic.
     mem_limit: 512m
     ulimits:
       nofile:

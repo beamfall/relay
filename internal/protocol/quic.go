@@ -21,6 +21,11 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+// QUICStreamReceiveWindowBytes is the most one QUIC carrier stream buffers on
+// the receiving side when its reader stalls. The relay's stream memory budget
+// counts it per stream when the QUIC carrier is enabled.
+const QUICStreamReceiveWindowBytes = 8 * 1024 * 1024
+
 // QUICConfig returns the quic-go transport config shared by the relay (server
 // side) and the tunnel client (client side). Both ends MUST use the same
 // config so flow-control and keep-alive expectations match, mirroring
@@ -39,7 +44,7 @@ import (
 //     lets a dead peer be detected, mirroring yamux's EnableKeepAlive default.
 func QUICConfig() *quic.Config {
 	return &quic.Config{
-		MaxStreamReceiveWindow:     8 * 1024 * 1024,
+		MaxStreamReceiveWindow:     QUICStreamReceiveWindowBytes,
 		MaxConnectionReceiveWindow: 64 * 1024 * 1024,
 		MaxIncomingStreams:         1024,
 		KeepAlivePeriod:            15 * time.Second,

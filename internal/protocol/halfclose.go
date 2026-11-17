@@ -3,6 +3,7 @@ package protocol
 import (
 	"io"
 	"net"
+	"time"
 
 	"github.com/hashicorp/yamux"
 )
@@ -40,4 +41,24 @@ func AbortStream(stream net.Conn) {
 		return
 	}
 	_ = stream.Close()
+}
+
+// DiscardAbortedStream reads and discards what the peer still sends on a
+// stream AbortStream has closed, and returns once the stream is gone. A QUIC
+// abort resets the stream at once, so there is nothing to wait for. A yamux
+// abort is only a half-close: the stream and its receive buffer stay in the
+// session until the peer answers with its own close or StreamCloseTimeout
+// resets it. A peer blocked on a shut window cannot answer, so the buffered
+// bytes are taken off it here, which lets a well-behaved peer finish in
+// milliseconds. A caller that accounts for the stream's memory keeps that
+// account open until this returns (CORE-2252).
+func DiscardAbortedStream(stream net.Conn) {
+	ys, ok := stream.(*yamux.Stream)
+	if !ok {
+		return
+	}
+	// The close timeout ends the stream; the deadline only guards against a
+	// read that would otherwise never return.
+	_ = ys.SetReadDeadline(time.Now().Add(yamuxStreamCloseTimeout + 5*time.Second))
+	_, _ = io.Copy(io.Discard, ys)
 }

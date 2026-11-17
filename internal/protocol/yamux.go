@@ -85,8 +85,12 @@ func YamuxConfig(streamWindowBytes int) *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.ConnectionWriteTimeout = 30 * time.Second
 	cfg.MaxStreamWindowSize = uint32(streamWindowBytes)
-	cfg.StreamCloseTimeout = 30 * time.Second
+	cfg.StreamCloseTimeout = yamuxStreamCloseTimeout
 	cfg.EnableKeepAlive = true
 	cfg.LogOutput = io.Discard
 	return cfg
 }
+
+// yamuxStreamCloseTimeout is how long a half-closed stream waits for its peer
+// before it is reset.
+const yamuxStreamCloseTimeout = 30 * time.Second

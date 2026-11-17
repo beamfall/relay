@@ -154,6 +154,8 @@ type metrics struct {
 	handshakeFailures              atomic.Int64
 	fairUseRefusals                atomic.Int64
 	publicOverCap                  atomic.Int64
+	streamMemoryBudgetRefusals     atomic.Int64
+	streamsStalledClosed           atomic.Int64
 	publicPerIPOverCap             atomic.Int64
 	carrierOverCap                 atomic.Int64
 	carrierPendingPerSourceOverCap atomic.Int64
@@ -341,6 +343,12 @@ func (m *metrics) newMetricsRegistry() *prometheus.Registry {
 	counter("beamfall_relay_public_over_cap_total",
 		"Public connections rejected for exceeding the global concurrency cap.",
 		m.publicOverCap.Load)
+	counter("beamfall_relay_stream_memory_budget_refusals_total",
+		"Public connections refused because the relay already carries as many streams as its stream memory budget allows.",
+		m.streamMemoryBudgetRefusals.Load)
+	counter("beamfall_relay_streams_stalled_closed_total",
+		"Relayed streams closed because the public client accepted no bytes for the client write stall timeout.",
+		m.streamsStalledClosed.Load)
 	counter("beamfall_relay_public_per_ip_over_cap_total",
 		"Public connections rejected for exceeding the per-source-IP concurrency cap.",
 		m.publicPerIPOverCap.Load)

@@ -171,6 +171,19 @@ type Config struct {
 	// configured with the same value, since yamux requires both ends of a
 	// session to agree on window size.
 	YamuxStreamWindowBytes int
+	// ClientWriteStallTimeout closes a relayed stream whose public client
+	// accepts no bytes for this long while the relay holds data for it. Any
+	// progress restarts it, and a stream with nothing to send is not affected.
+	// <=0 uses DefaultClientWriteStallTimeout.
+	ClientWriteStallTimeout time.Duration
+	// StreamMemoryBudgetBytes bounds the memory relayed streams can buffer in
+	// total. A client that reads slowly or not at all lets the home fill one
+	// carrier stream window in the relay, so the relay carries at most this
+	// budget divided by one stream's worst-case cost (StreamMemoryStreamLimit)
+	// streams at once and refuses the rest. Size the process memory limit to
+	// at least this plus StreamMemoryHeadroomBytes. <=0 uses
+	// DefaultStreamMemoryBudgetBytes.
+	StreamMemoryBudgetBytes int64
 }
 
 type Server struct {
@@ -202,6 +215,9 @@ type Server struct {
 	carrierSlots           chan struct{}         // semaphore bounding authenticated carrier sessions
 	publicPerIP            *perIPLimiter         // bounds public conns per IPv4 /32 or IPv6 /64
 	publicPerCarrier       *sourceCarrierLimiter // bounds streams per source prefix and carrier
+	identityStreams        *perIPLimiter         // bounds streams per carrier identity, across its live and superseded carriers
+	streamSlots            chan struct{}         // semaphore bounding relayed streams to the stream memory budget
+	clientWriteStallT      time.Duration         // closes a stream whose public client accepts no bytes this long
 	publicPeekT            time.Duration         // TLS ClientHello peek deadline (SNI-blind routing)
 	carrierHandshakeT      time.Duration
 	streamWG               sync.WaitGroup // tracks in-flight relayed public streams (for drain)
@@ -293,6 +309,13 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.PublicPeekTimeout <= 0 {
 		cfg.PublicPeekTimeout = 3 * time.Second
 	}
+	if cfg.ClientWriteStallTimeout <= 0 {
+		cfg.ClientWriteStallTimeout = DefaultClientWriteStallTimeout
+	}
+	if cfg.StreamMemoryBudgetBytes <= 0 {
+		cfg.StreamMemoryBudgetBytes = DefaultStreamMemoryBudgetBytes
+	}
+	streamLimit := StreamMemoryStreamLimit(cfg.StreamMemoryBudgetBytes, cfg.YamuxStreamWindowBytes, cfg.QUICAddr != "")
 	if cfg.MaxCarrierConns <= 0 {
 		cfg.MaxCarrierConns = DefaultMaxCarrierConns
 	}
@@ -375,6 +398,9 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		carrierSlots:           make(chan struct{}, cfg.MaxCarrierConns),
 		publicPerIP:            newPerIPLimiter(cfg.MaxPublicConnsPerIP),
 		publicPerCarrier:       newSourceCarrierLimiter(cfg.MaxStreamsPerIPPerCarrier),
+		identityStreams:        newPerIPLimiter(cfg.StreamCap),
+		streamSlots:            make(chan struct{}, streamLimit),
+		clientWriteStallT:      cfg.ClientWriteStallTimeout,
 		publicPeekT:            cfg.PublicPeekTimeout,
 		carrierHandshakeT:      cfg.CarrierHandshakeTimeout,
 		shutdownGrace:          cfg.ShutdownGrace,
@@ -394,6 +420,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	}
 	s.tracer = tp.Tracer("github.com/beamfall/relay")
 	s.logger.Info("connection log redaction", "mode", connectionLogMode(s.redactConnLogs))
+	s.logger.Info("stream memory budget", "bytes", cfg.StreamMemoryBudgetBytes, "max_streams", streamLimit, "client_write_stall_timeout", cfg.ClientWriteStallTimeout)
 	s.metrics.fairUse = s.fairUse
 	// Wire the nonce-cache pressure gauges only when the configured verifier
 	// exposes a snapshot (MEMHID-RELAY-NONCE-GAUGE); other verifiers simply
@@ -1438,14 +1465,39 @@ func (s *Server) handlePublicConn(ctx context.Context, conn net.Conn) {
 		}
 		return
 	}
+	// Every relayed stream can pin a carrier stream window in the relay, so
+	// the relay-wide stream count is held to the stream memory budget.
+	releaseSlot := func() { <-s.streamSlots }
+	select {
+	case s.streamSlots <- struct{}{}:
+		// The slot is held until the carrier stream is gone, which after an
+		// abrupt end can be later than this handler: see the splice call.
+		defer func() { releaseSlot() }()
+	default:
+		s.metrics.streamMemoryBudgetRefusals.Add(1)
+		if s.publicRejectLog.shouldLog("stream_memory_budget_reached") {
+			if s.redactConnLogs {
+				s.logger.Warn("public rejected", "reason", "stream_memory_budget_reached")
+			} else {
+				s.logger.Warn("public rejected", "remote", conn.RemoteAddr(), "host", result.ServerName, "carrier", carrier.id, "reason", "stream_memory_budget_reached")
+			}
+		}
+		return
+	}
 	source := sourcePrefix(conn.RemoteAddr())
 	carrier, stream, release, err := s.openCarrierStream(result.ServerName, source, carrier)
-	if errors.Is(err, errSourceCarrierCapReached) {
-		if s.publicRejectLog.shouldLog("source_carrier_stream_cap_reached") {
+	for capErr, reason := range map[error]string{
+		errSourceCarrierCapReached:  "source_carrier_stream_cap_reached",
+		errIdentityStreamCapReached: "identity_stream_cap_reached",
+	} {
+		if !errors.Is(err, capErr) {
+			continue
+		}
+		if s.publicRejectLog.shouldLog(reason) {
 			if s.redactConnLogs {
-				s.logger.Warn("public rejected", "reason", "source_carrier_stream_cap_reached")
+				s.logger.Warn("public rejected", "reason", reason)
 			} else {
-				s.logger.Warn("public rejected", "remote", conn.RemoteAddr(), "host", result.ServerName, "carrier", carrier.id, "reason", "source_carrier_stream_cap_reached")
+				s.logger.Warn("public rejected", "remote", conn.RemoteAddr(), "host", result.ServerName, "carrier", carrier.id, "reason", reason)
 			}
 		}
 		return
@@ -1486,7 +1538,18 @@ func (s *Server) handlePublicConn(ctx context.Context, conn net.Conn) {
 	}
 
 	clientReader := io.MultiReader(bytesReader(result.Prefix), conn)
-	s.splice(ctx, carrier, stream, conn, clientReader)
+	if s.splice(ctx, carrier, stream, conn, clientReader) {
+		return
+	}
+	// The stream ended abruptly. Its carrier stream can keep a full receive
+	// buffer until the home closes it, so the memory slot stays taken until
+	// then, off this handler so the client connection is released now.
+	freeSlot := releaseSlot
+	releaseSlot = func() {}
+	go func() {
+		defer freeSlot()
+		protocol.DiscardAbortedStream(stream)
+	}()
 }
 
 // openCarrierStream opens a stream for source on carrier, retrying once on a
@@ -1499,8 +1562,16 @@ func (s *Server) openCarrierStream(host, source string, selected *carrier) (*car
 		if !s.publicPerCarrier.acquire(source, c.id) {
 			return c, nil, nil, errSourceCarrierCapReached
 		}
+		// c.open counts streams per carrier object. A rotation leaves the old
+		// carrier's streams running beside the new carrier's, so the identity
+		// is also held to one stream cap across all of its carriers.
+		if !s.identityStreams.acquire(c.id) {
+			s.publicPerCarrier.release(source, c.id)
+			return c, nil, nil, errIdentityStreamCapReached
+		}
 		stream, release, err := c.open()
 		if err != nil {
+			s.identityStreams.release(c.id)
 			s.publicPerCarrier.release(source, c.id)
 			return c, stream, release, err
 		}
@@ -1508,6 +1579,7 @@ func (s *Server) openCarrierStream(host, source string, selected *carrier) (*car
 			if release != nil {
 				release()
 			}
+			s.identityStreams.release(c.id)
 			s.publicPerCarrier.release(source, c.id)
 		}, nil
 	}
@@ -1563,7 +1635,14 @@ const abruptSpliceDeadline = 250 * time.Millisecond
 // long-poll). A well-behaved home backend closes on the propagated half-close, so
 // this only bites a hung upstream -- MaxPublicConns + StreamCap bound the total
 // exposure instead.
-func (s *Server) splice(ctx context.Context, carrier *carrier, upstream net.Conn, client net.Conn, clientReader io.Reader) {
+//
+// The opposite stall is bounded (CORE-2252): a client that accepts no bytes
+// while the upstream has data for it pins up to a carrier stream window in the
+// relay. That is not an idle connection, so writes to the client go through a
+// stallWriter, which ends the stream abruptly once the client has accepted
+// nothing for clientWriteStallT. A stream with nothing to send never trips it.
+// splice reports whether both directions ended cleanly.
+func (s *Server) splice(ctx context.Context, carrier *carrier, upstream net.Conn, client net.Conn, clientReader io.Reader) bool {
 	done := make(chan spliceResult, 2)
 	copyBytes := func(dst io.Writer, src io.Reader, direction string) {
 		// A panic here is outside the connection handler's recover. Report it
@@ -1591,14 +1670,20 @@ func (s *Server) splice(ctx context.Context, carrier *carrier, upstream net.Conn
 		if err == nil {
 			// Clean EOF: propagate the half-close so the peer sees it, but leave
 			// the live opposite direction running.
+			if w, ok := dst.(*stallWriter); ok {
+				dst = w.conn
+			}
 			protocol.HalfCloseWrite(dst)
 		}
 		done <- spliceResult{clean: err == nil}
 	}
 	go copyBytes(upstream, clientReader, directionToCarrier)
-	go copyBytes(client, upstream, directionToClient)
+	go copyBytes(&stallWriter{conn: client, timeout: s.clientWriteStallT, stalled: func() {
+		s.metrics.streamsStalledClosed.Add(1)
+	}}, upstream, directionToClient)
 
-	if r := <-done; !r.clean {
+	first := <-done
+	if !first.clean {
 		// One side died abruptly. Bound both blocked operations before aborting
 		// both stream directions so a transport-specific half-close cannot park
 		// the surviving copy indefinitely.
@@ -1608,7 +1693,8 @@ func (s *Server) splice(ctx context.Context, carrier *carrier, upstream net.Conn
 		protocol.AbortStream(upstream)
 		protocol.AbortStream(client)
 	}
-	<-done
+	second := <-done
+	return first.clean && second.clean
 }
 
 type byteSliceReader []byte

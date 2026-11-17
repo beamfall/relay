@@ -18,6 +18,11 @@ default budget plus the relay's documented headroom SHALL fit the shipped memory
 - **WHEN** a public connection arrives while the relay already carries its stream limit
 - **THEN** the relay closes that connection and counts a stream memory budget refusal
 
+#### Scenario: Stream cut short while the home keeps sending
+
+- **WHEN** the relay closes a stream before its home has closed its end
+- **THEN** the stream still counts against the stream limit until the carrier has released it
+
 #### Scenario: Default budget fits the shipped limit
 
 - **WHEN** the relay runs with its default stream memory budget

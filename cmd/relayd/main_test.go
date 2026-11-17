@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -460,6 +461,14 @@ func TestEnvExamplesAreProductionSafe(t *testing.T) {
 			_, err := config.IntEnvOrDefault(value, 1024)
 			return err
 		},
+		"RELAYD_CLIENT_WRITE_STALL_TIMEOUT": func(value string) error {
+			_, err := config.DurationEnvOrDefault(value, relay.DefaultClientWriteStallTimeout)
+			return err
+		},
+		"RELAYD_STREAM_MEMORY_BUDGET_BYTES": func(value string) error {
+			_, err := config.Int64EnvOrDefault(value, relay.DefaultStreamMemoryBudgetBytes)
+			return err
+		},
 		"RELAYD_FAIR_USE_ENABLED": func(value string) error {
 			_, err := config.BoolEnvOrDefault(value, false)
 			return err
@@ -568,5 +577,45 @@ func validateExampleTokenTTL(value string) error {
 func TestDefaultHMACNonceStorePathIsDeterministicAndSecure(t *testing.T) {
 	if defaultHMACNonceStorePath != "/var/lib/beamfall-relay/hmac-nonces.json" {
 		t.Fatalf("default hmac nonce store path = %q", defaultHMACNonceStorePath)
+	}
+}
+
+// CORE-2252: the stall timeout and stream memory budget reach relay.Config.
+func TestStreamMemoryFlagsReachRelayConfig(t *testing.T) {
+	cfg := buildRelayConfig(relaydFlags{clientWriteStallTimeout: 90 * time.Second, streamMemoryBudgetBytes: 1 << 30})
+	if cfg.ClientWriteStallTimeout != 90*time.Second {
+		t.Fatalf("ClientWriteStallTimeout = %v, want 90s", cfg.ClientWriteStallTimeout)
+	}
+	if cfg.StreamMemoryBudgetBytes != 1<<30 {
+		t.Fatalf("StreamMemoryBudgetBytes = %d, want 1 GiB", cfg.StreamMemoryBudgetBytes)
+	}
+}
+
+// CORE-2252: relayd sets the Go memory limit to the stream memory budget plus
+// headroom, and leaves an operator's GOMEMLIMIT alone.
+func TestApplyMemoryLimit(t *testing.T) {
+	previous := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(previous) })
+
+	if limit, set := applyMemoryLimit(1<<30, "2GiB"); set || limit != 0 {
+		t.Fatalf("applyMemoryLimit with GOMEMLIMIT set = (%d, %v), want it left alone", limit, set)
+	}
+	if got := debug.SetMemoryLimit(-1); got != previous {
+		t.Fatalf("memory limit changed to %d although GOMEMLIMIT was set", got)
+	}
+
+	want := int64(relay.DefaultStreamMemoryBudgetBytes + relay.StreamMemoryHeadroomBytes)
+	if limit, set := applyMemoryLimit(0, ""); !set || limit != want {
+		t.Fatalf("applyMemoryLimit default = (%d, %v), want (%d, true)", limit, set, want)
+	}
+	if got := debug.SetMemoryLimit(-1); got != want {
+		t.Fatalf("runtime memory limit = %d, want %d", got, want)
+	}
+	if want > 512<<20 {
+		t.Fatalf("default memory limit %d is over the shipped 512 MiB limit", want)
+	}
+
+	if limit, _ := applyMemoryLimit(1<<30, ""); limit != 1<<30+relay.StreamMemoryHeadroomBytes {
+		t.Fatalf("applyMemoryLimit(1 GiB) = %d, want budget plus headroom", limit)
 	}
 }

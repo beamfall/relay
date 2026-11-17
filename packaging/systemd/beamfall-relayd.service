@@ -18,13 +18,25 @@ ExecStart=/usr/local/bin/relayd
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
-# Bounds this unit's resident memory. relayd's steady-state usage is dominated by per-connection
-# splice buffers (32 KiB per direction; see internal/relay/relay.go) plus goroutine/TLS overhead:
-# the default --max-public-conns (1024) alone bounds splice buffers to roughly 64 MiB, so 512M
-# is a conservative starting ceiling with headroom for the fair-use in-memory accounting and HMAC
-# replay-nonce maps. Raise it if you raise --max-public-conns/--stream-cap well above their
-# defaults, and confirm the actual ceiling against `systemctl status beamfall-relayd` (or the
-# cgroup's memory.peak) under your real traffic rather than trusting this default unmeasured.
+# Bounds this unit's resident memory. Sizing rule: MemoryMax must be at least
+# --stream-memory-budget-bytes plus 128 MiB of headroom. The shipped defaults are 320 MiB + 128 MiB
+# = 448 MiB, inside 512M.
+# - The stream memory budget covers what relayed streams buffer. A public client that stops
+#   reading lets the home fill one carrier stream window (--yamux-stream-window-bytes, 4 MiB by
+#   default) in relayd, held in a buffer that can reach twice that size, or one 8 MiB QUIC stream
+#   window when the QUIC carrier is on. relayd carries at most budget / that per-stream cost
+#   streams at once (40 at the defaults) and refuses the rest, and it closes a stream whose client
+#   accepts no bytes for --client-write-stall-timeout (5m).
+# - The headroom covers the 32 KiB per-direction splice buffers of the streams relayd carries,
+#   goroutine and TLS state for up to --max-public-conns connections, and the fair-use and
+#   replay-nonce maps.
+# - MemoryMax also charges kernel socket buffers, which the budget does not count: a stalled
+#   client can hold a few more MiB of unsent data per stream in the kernel.
+# relayd sets the Go runtime's soft memory limit to budget + headroom unless GOMEMLIMIT is set.
+# To carry more streams, raise --stream-memory-budget-bytes and MemoryMax together, or lower the
+# stream window on both relay and tunnel client. Raise MemoryMax too if you raise
+# --max-public-conns well above its default, and check `systemctl status beamfall-relayd` (or
+# the cgroup's memory.peak) under your real traffic.
 MemoryMax=512M
 # Each accepted public or carrier TCP connection holds one file descriptor for the life of the
 # connection (yamux multiplexes a carrier's streams over its single socket, so streams do not add

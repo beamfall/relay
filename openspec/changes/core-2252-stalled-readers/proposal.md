@@ -32,7 +32,8 @@ twice its cap. The packaging comments sized the memory limit from splice buffers
 
 ## Non-goals
 
-- Changing the shipped memory limit, the default stream window or any default connection cap.
+- Changing the shipped memory limit, the default stream window or any existing connection cap
+  default. The stream memory budget is a new relay-wide cap: 40 streams at the defaults.
 - A per-home share of the stream memory budget. One home, or one source inside its own caps, can
   still take every slot of a small budget; the result is refused connections, not a dead relay.
 - Bounding connections that idle before sending a ClientHello beyond the existing peek timeout.

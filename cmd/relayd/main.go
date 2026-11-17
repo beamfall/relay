@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -69,6 +70,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("load max streams per IP per carrier default: %v", err)
 	}
+	clientWriteStallTimeoutDefault, err := config.DurationEnvOrDefault(os.Getenv("RELAYD_CLIENT_WRITE_STALL_TIMEOUT"), relay.DefaultClientWriteStallTimeout)
+	if err != nil {
+		log.Fatalf("load client write stall timeout default: %v", err)
+	}
+	streamMemoryBudgetDefault, err := config.Int64EnvOrDefault(os.Getenv("RELAYD_STREAM_MEMORY_BUDGET_BYTES"), relay.DefaultStreamMemoryBudgetBytes)
+	if err != nil {
+		log.Fatalf("load stream memory budget default: %v", err)
+	}
 	streamCap, err := registerStreamCapFlag(flag.CommandLine, os.Getenv("RELAYD_STREAM_CAP"))
 	if err != nil {
 		log.Fatalf("load stream cap default: %v", err)
@@ -123,6 +132,8 @@ func main() {
 		supersededStreamMaxAge   = flag.Duration("superseded-stream-max-age", 4*time.Hour, "how long past its token expiry a superseded carrier may keep existing streams while a live same-identity carrier holds its hostnames; 0 restores the expired-session-drain cut")
 		redactConnectionLogs     = flag.Bool("redact-connection-logs", redactConnectionLogsDefault, "omit public remote address, SNI hostname, and carrier id from connection logs")
 		yamuxStreamWindowBytes   = flag.Int("yamux-stream-window-bytes", 0, "v1 (TLS/TCP) carrier per-stream flow-control window in bytes; 0 uses the 4 MiB default. The tunnel client's --yamux-stream-window-bytes MUST match.")
+		clientWriteStallTimeout  = flag.Duration("client-write-stall-timeout", clientWriteStallTimeoutDefault, "close a stream whose public client accepts no bytes for this long while the relay holds data for it; a client that takes any bytes inside the period keeps its stream; 0 uses the 5m default")
+		streamMemoryBudgetBytes  = flag.Int64("stream-memory-budget-bytes", streamMemoryBudgetDefault, "memory relayed streams may buffer in total; the relay carries at most this divided by one stream's worst-case buffer (twice the yamux stream window, or the 8 MiB QUIC stream window if larger) and refuses streams beyond it; keep the host memory limit at least 128 MiB above it; 0 uses the 320 MiB default")
 	)
 	flag.Parse()
 
@@ -142,6 +153,9 @@ func main() {
 		log.Fatalf("carrier token rejected: %v", err)
 	}
 	logger := slog.Default()
+	if limit, set := applyMemoryLimit(*streamMemoryBudgetBytes, os.Getenv("GOMEMLIMIT")); set {
+		logger.Info("go memory limit set from the stream memory budget", "bytes", limit)
+	}
 	certReloader, err := config.NewCertificateReloader(*certFile, *keyFile, logger)
 	if err != nil {
 		log.Fatalf("load carrier TLS certificate: %v", err)
@@ -203,6 +217,8 @@ func main() {
 		fairUseFenceMargin:       *fairUseFenceMargin,
 		redactConnectionLogs:     redactConnectionLogs,
 		yamuxStreamWindowBytes:   *yamuxStreamWindowBytes,
+		clientWriteStallTimeout:  *clientWriteStallTimeout,
+		streamMemoryBudgetBytes:  *streamMemoryBudgetBytes,
 		logger:                   logger,
 	}))
 	if err != nil {
@@ -498,6 +514,8 @@ type relaydFlags struct {
 	supersededStreamMaxAge   time.Duration
 	redactConnectionLogs     *bool
 	yamuxStreamWindowBytes   int
+	clientWriteStallTimeout  time.Duration
+	streamMemoryBudgetBytes  int64
 	fairUseEnabled           bool
 	fairUseWindowDays        int
 	fairUseSoftLimitBytes    int64
@@ -592,6 +610,8 @@ func buildRelayConfig(f relaydFlags) relay.Config {
 		SupersededStreamMaxAge:          f.supersededStreamMaxAge,
 		RedactConnectionLogs:            f.redactConnectionLogs,
 		YamuxStreamWindowBytes:          f.yamuxStreamWindowBytes,
+		ClientWriteStallTimeout:         f.clientWriteStallTimeout,
+		StreamMemoryBudgetBytes:         f.streamMemoryBudgetBytes,
 		FairUse: relay.FairUseConfig{
 			Enabled:           f.fairUseEnabled,
 			WindowDays:        f.fairUseWindowDays,
@@ -608,4 +628,20 @@ func buildRelayConfig(f relaydFlags) relay.Config {
 	}
 	cfg.MaxStreamsPerIPPerCarrier = f.maxStreamsPerCarrierIP
 	return cfg
+}
+
+// applyMemoryLimit gives the Go runtime a soft memory limit of the stream
+// memory budget plus the relay's headroom, so the collector keeps garbage
+// from stream buffers inside the sizing rule the packaging documents. An
+// operator's GOMEMLIMIT wins. It reports the limit and whether it set one.
+func applyMemoryLimit(streamMemoryBudgetBytes int64, gomemlimit string) (int64, bool) {
+	if gomemlimit != "" {
+		return 0, false
+	}
+	if streamMemoryBudgetBytes <= 0 {
+		streamMemoryBudgetBytes = relay.DefaultStreamMemoryBudgetBytes
+	}
+	limit := streamMemoryBudgetBytes + relay.StreamMemoryHeadroomBytes
+	debug.SetMemoryLimit(limit)
+	return limit, true
 }

@@ -26,8 +26,12 @@ func newPerIPLimiter(max int) *perIPLimiter {
 }
 
 // acquire reserves one slot for ip, returning false when ip already holds max
-// concurrent connections. On false the caller must not release.
+// concurrent connections. On false the caller must not release. A nil limiter
+// admits everything.
 func (l *perIPLimiter) acquire(ip string) bool {
+	if l == nil {
+		return true
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.counts[ip] >= l.max {
@@ -40,6 +44,9 @@ func (l *perIPLimiter) acquire(ip string) bool {
 // release returns one slot held by ip. It must be called exactly once per
 // successful acquire.
 func (l *perIPLimiter) release(ip string) {
+	if l == nil {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.counts[ip] <= 1 {

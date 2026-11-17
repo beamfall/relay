@@ -31,9 +31,11 @@ missing row as a doc bug, not a flag to skip.
 | `--hostnames` | `RELAYD_HOSTNAMES` | *(empty; required)* | comma-separated hostnames this relay accepts |
 | `--max-public-conns` | `RELAYD_MAX_PUBLIC_CONNS` | `1024` | global concurrent public-connection cap; `0` uses the default |
 | `--max-public-conns-per-ip` | `RELAYD_MAX_PUBLIC_CONNS_PER_IP` | `64` | per-source-prefix (IPv4 /32, IPv6 /64) concurrent public-connection cap; `0` uses the default |
+| `--stream-memory-budget-bytes` | `RELAYD_STREAM_MEMORY_BUDGET_BYTES` | `335544320` (320 MiB) | memory relayed streams may buffer in total. The relay carries at most budget ÷ per-stream cost streams at once, across all homes, and refuses the rest; the cost is twice `--yamux-stream-window-bytes` (8 MiB at the default), or the 8 MiB QUIC stream window if larger and the QUIC carrier is on. 40 streams at the defaults. Keep the host memory limit at least 128 MiB above it; `0` uses the default |
+| `--client-write-stall-timeout` | `RELAYD_CLIENT_WRITE_STALL_TIMEOUT` | `5m` | close a stream whose public client accepts no bytes for this long while the relay holds data for it. A client that takes any bytes inside the period keeps its stream, so a slow or briefly paused player is not cut; `0` uses the default |
 | `--max-streams-per-ip-per-carrier` | `RELAYD_MAX_STREAMS_PER_IP_PER_CARRIER` | one quarter of `--stream-cap`, min 1 | per-source-prefix, per-carrier concurrent-stream cap; `0` uses the derived default |
 | `--public-peek-timeout` | *(flag-only)* | `3s` | how long the public listener waits to read a ClientHello before closing; `0` uses the default |
-| `--max-carrier-conns` | *(flag-only)* | `256` | max authenticated carrier sessions; a connection takes a slot only after its token verifies. Core rotates its carrier every two minutes and the old one stays until its streams drain, so size this for **twice** the number of home servers (the default fits about 128). Over the cap an authenticated carrier is refused with `"over capacity"` and retries; `0` uses the default |
+| `--max-carrier-conns` | *(flag-only)* | `256` | max authenticated carrier sessions; a connection takes a slot only after its token verifies. Core rotates its carrier every two minutes and the old one stays until its streams drain, so size this for **twice** the number of home servers (the default fits about 128 carriers; the 40 streams of the default `--stream-memory-budget-bytes` are shared by all of them and are usually the limit you reach first). Over the cap an authenticated carrier is refused with `"over capacity"` and retries; `0` uses the default |
 | `--max-pending-carrier-conns` | *(flag-only)* | `64` | max carrier connections not yet authenticated (in handshake back-off or the handshake itself). When the budget is full a new connection is admitted and the oldest pending connection of the source holding the most is closed, so idle connections cannot keep a valid carrier out; a connection that sends no hello is closed after 5 s. `0` uses the default |
 | `--max-pending-carrier-conns-per-ip` | *(flag-only)* | `8` | per-source-prefix (IPv4 /32, IPv6 /64) cap on unauthenticated carrier connections, so one source cannot hold the whole pending budget; `0` uses the default |
 | `--rate-bytes-per-sec` | *(flag-only)* | `0` (disabled) | per-carrier byte rate limit |
@@ -42,7 +44,7 @@ missing row as a doc bug, not a flag to skip.
 | `--shutdown-grace` | *(flag-only)* | `30s` | on shutdown, wait this long for in-flight streams to drain before force-close; `0` = immediate |
 | `--expired-session-drain` | *(flag-only)* | `30s` | grace for streams on a superseded carrier to drain once it is past token expiry and no live same-identity carrier remains |
 | `--superseded-stream-max-age` | *(flag-only)* | `4h` | how long past its token expiry a superseded carrier may keep existing streams while a live same-identity carrier holds its hostnames; `0` restores the cut at `expires-at` plus `--expired-session-drain` |
-| `--yamux-stream-window-bytes` | *(flag-only)* | `0` (uses the 4 MiB built-in default) | v1 (TLS/TCP) carrier per-stream flow-control window; 0 or 262144 (256 KiB) to 4294967295 bytes, other values are refused at startup; the tunnel client's matching flag MUST agree. One stream moves about half a window per round trip (4 MiB ≈ 40 MB/s at 50 ms); a stalled reader can hold up to one window, so worst-case buffering is `--max-public-conns` × window |
+| `--yamux-stream-window-bytes` | *(flag-only)* | `0` (uses the 4 MiB built-in default) | v1 (TLS/TCP) carrier per-stream flow-control window; 0 or 262144 (256 KiB) to 4294967295 bytes, other values are refused at startup; the tunnel client's matching flag MUST agree. One stream moves about half a window per round trip (4 MiB ≈ 40 MB/s at 50 ms); a stalled reader can hold up to one window in a buffer of up to twice that size, which is what `--stream-memory-budget-bytes` counts per stream |
 | `--redact-connection-logs` | `RELAYD_REDACT_CONNECTION_LOGS` | `true` | omit public remote address, SNI hostname, and carrier id from connection logs |
 | `--fair-use-enabled` | `RELAYD_FAIR_USE_ENABLED` | `false` | enable rolling-window fair-use accounting and hard-limit throttling |
 | `--fair-use-window-days` | `RELAYD_FAIR_USE_WINDOW_DAYS` | `30` | fair-use rolling window in days |
@@ -517,6 +519,8 @@ alert fires.
   - `beamfall_relay_stream_forward_seconds{direction}` — latency the relay adds to an established stream: the time from a chunk being read on one side to written on the other. `direction` is `to_carrier` (viewer to home server) or `to_client`. A rising upper tail means chunks are waiting on a full carrier or a slow viewer. See [relay-latency-budget.md](relay-latency-budget.md).
   - `beamfall_relay_stream_forward_jitter_seconds{direction}` — the absolute change in that latency between consecutive chunks of one stream direction.
   - `beamfall_relay_nonce_store_fill_ratio` — hmac mode only: live replay nonce-store entries divided by `--hmac-nonce-store-capacity`. New carrier dials are refused at `1`; alert at `0.8` (see "Replay Nonce Store Sizing").
+  - `beamfall_relay_stream_memory_budget_refusals_total` — public connections refused because the relay already carried every stream its `--stream-memory-budget-bytes` allows. A rising counter under real use means the budget (and the memory limit with it) is too small for the homes on this relay.
+  - `beamfall_relay_streams_stalled_closed_total` — streams closed because the public client accepted no bytes for `--client-write-stall-timeout`.
   - `beamfall_relay_public_over_cap_total` — public connections dropped at accept because the global concurrent-connection cap (`MaxPublicConns`) was exhausted; a rising counter signals a connection flood or an undersized cap. Raise or lower the cap with `--max-public-conns` / `RELAYD_MAX_PUBLIC_CONNS` (default 1024; 0 uses the built-in default).
   - `beamfall_relay_public_per_ip_over_cap_total` — public connections dropped at accept because a single source prefix (IPv4 /32 or IPv6 /64) already held its concurrent-connection cap (`--max-public-conns-per-ip` / `RELAYD_MAX_PUBLIC_CONNS_PER_IP`, default 64; 0 uses the built-in default). A rising counter with a small distinct-source set signals a slow-loris / partial-record flood from one origin. See "Public-listener flood posture" below.
   - `beamfall_relay_fairuse_refused_connections_total`
@@ -615,13 +619,44 @@ degrading the host:
 - **Compose** (`packaging/compose/compose.self-hosted.yml`): `mem_limit: 512m`, `ulimits.nofile`
   soft/hard `65536`.
 
-Both are conservative starting points derived from the shipped connection caps above — each
-public/carrier connection holds one file descriptor and, while relaying, a 32 KiB splice buffer
-per direction — not a benchmarked ceiling for your traffic. If you raise `--max-public-conns`,
-`--max-carrier-conns`, `--max-pending-carrier-conns`, or `--stream-cap` well past their defaults, raise these limits
-proportionally and confirm the real ceiling against observed memory/fd usage
-(`systemctl status beamfall-relayd` or the container's cgroup stats) rather than trusting the
-shipped numbers unmeasured.
+**Memory sizing rule:** the memory limit must be at least `--stream-memory-budget-bytes` plus
+128 MiB of headroom. The shipped defaults are 320 MiB + 128 MiB = 448 MiB, inside the 512 MiB
+limit.
+
+- The budget covers stream buffers. When a public client stops reading, the home can fill one
+  carrier stream window in the relay before flow control stops it: 4 MiB on the yamux carrier
+  (in a buffer that can reach 8 MiB), 8 MiB on the QUIC carrier. The relay divides the budget by
+  that per-stream cost and carries at most that many streams at once across all homes: 40 at the
+  defaults. Further public connections are refused and counted in
+  `beamfall_relay_stream_memory_budget_refusals_total`. A client that accepts no bytes for
+  `--client-write-stall-timeout` is closed, which returns its window. A stream the relay cuts
+  short keeps its slot until the home closes its end, at most 35 seconds, because the carrier
+  holds the stream's buffer until then.
+- The slots are first come, first served across all homes. Sources that each stay inside
+  `--max-streams-per-ip-per-carrier` can together take every slot, and other viewers are then
+  refused until a stream ends. Raise the budget and the memory limit together if
+  `beamfall_relay_stream_memory_budget_refusals_total` rises under normal use.
+- A reader slower than the client's TCP window probe can look stalled: a client that takes no
+  bytes at all for the whole timeout is closed, however slow it meant to be.
+- The headroom covers the 32 KiB per-direction splice buffers, goroutine and TLS state, and the
+  fair-use and replay-nonce maps at the default connection caps. A container or systemd memory
+  limit also charges the kernel's socket buffers, which the budget does not count: a stalled
+  client can hold a few more MiB of unsent data per stream in the kernel. Check the cgroup's
+  `memory.peak` under real traffic and raise the limit if it comes close.
+- `relayd` sets the Go runtime's soft memory limit to budget + headroom at startup unless
+  `GOMEMLIMIT` is set.
+
+The 40-stream default is below the per-home `--stream-cap` of 64, and it is shared by every home
+on the relay. One home with a few players fits. A relay that serves several homes, or one busy
+home, needs a larger budget and a memory limit raised with it (for example 1 GiB of budget and a
+1152 MiB limit for 128 streams), or a smaller stream window on both the relay and the tunnel
+client, which lowers the per-stream cost at the price of throughput per stream.
+
+The file-descriptor limit is a starting point derived from the connection caps: each
+public/carrier connection holds one descriptor. If you raise `--max-public-conns`,
+`--max-carrier-conns` or `--max-pending-carrier-conns` well past their defaults, raise both
+limits and confirm against observed memory/fd usage (`systemctl status beamfall-relayd` or the
+container's cgroup stats).
 
 ## Fair-use Accounting
 
