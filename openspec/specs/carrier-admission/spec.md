@@ -12,8 +12,9 @@ exhaust carrier capacity.
 
 The relay SHALL admit a carrier connection that has not yet authenticated only within a pending
 budget capped in total by `MaxPendingCarrierConns` and per source (IPv4 /32, IPv6 /64) by
-`MaxPendingCarrierConnsPerSource`, and SHALL close the connection on accept when either cap is
-reached. The relay SHALL release the pending admission once the handshake succeeds or fails.
+`MaxPendingCarrierConnsPerSource`. A new connection from a source at its cap SHALL be closed on
+accept. When the total is full the relay SHALL admit the new connection and close the oldest pending
+connection of the source holding the most. The admission SHALL be released when the handshake ends.
 
 #### Scenario: One source floods idle connections
 
@@ -25,6 +26,12 @@ reached. The relay SHALL release the pending admission once the handshake succee
 - **WHEN** a source already holds `MaxPendingCarrierConnsPerSource` unauthenticated carrier
   connections and opens another
 - **THEN** the relay closes the new connection without reading a frame
+
+#### Scenario: Idle connections from many sources fill the pending budget
+
+- **WHEN** idle connections from several sources hold every pending admission at the default caps
+- **THEN** a valid carrier from another source completes its handshake and receives an Ack, and one
+  idle connection is closed
 
 ### Requirement: Authenticated carrier slots are reserved only after token verification
 
@@ -57,3 +64,15 @@ handshake stream, and when the token is unauthorized.
 
 - **WHEN** a connection sends a hello with an unsupported protocol version
 - **THEN** the relay replies `"invalid hello"` and counts one failed handshake against its source
+
+### Requirement: A panic in one connection's handler does not stop the relay
+
+The relay SHALL recover a panic raised while handling a public or carrier connection, close that
+connection, release what it held, count the panic in `beamfall_relay_connection_panics_total` and
+log it without connection payload, and SHALL keep serving other connections.
+
+#### Scenario: Handler panics during a carrier handshake
+
+- **WHEN** a carrier connection's handler panics
+- **THEN** the panic is counted, the connection's pending admission is released, and the next valid
+  carrier completes its handshake
