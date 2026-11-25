@@ -962,3 +962,48 @@ func corruptToken(token string) string {
 	parts[2] = base64.RawURLEncoding.EncodeToString(sig)
 	return strings.Join(parts, ".")
 }
+
+func TestHostedTokenVerifierInvalidKeyLengthDoesNotPanic(t *testing.T) {
+	key := hostedTestKey()
+	now := hostedTestNow()
+	validTok := signHostedTestToken(t, key, hostedRelayClaims{
+		Type:      hostedRelayTokenType,
+		Issuer:    "beamfall-cloud",
+		Audience:  "beamfall-relay",
+		KeyID:     "relay-2026-06",
+		ServerID:  "srv_1",
+		Hostnames: []string{"home.relay.test"},
+		Purpose:   "tunnel-connect",
+		IssuedAt:  now,
+		ExpiresAt: now.Add(2 * time.Minute),
+		Nonce:     "nonce-valid",
+	})
+	badKeyTok := signHostedTestToken(t, key, hostedRelayClaims{
+		Type:      hostedRelayTokenType,
+		Issuer:    "beamfall-cloud",
+		Audience:  "beamfall-relay",
+		KeyID:     "bad-key",
+		ServerID:  "srv_1",
+		Hostnames: []string{"home.relay.test"},
+		Purpose:   "tunnel-connect",
+		IssuedAt:  now,
+		ExpiresAt: now.Add(2 * time.Minute),
+		Nonce:     "nonce-bad",
+	})
+
+	v := hostedTestVerifier(key.Public().(ed25519.PublicKey), now)
+	v.PublicKeys["bad-key"] = ed25519.PublicKey([]byte("too-short"))
+
+	if err := v.Validate(); err == nil {
+		t.Fatal("Validate() accepted short Ed25519 public key")
+	}
+	if _, err := v.VerifyTunnelToken(context.Background(), []byte(badKeyTok), []string{"home.relay.test"}); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("bad-key err = %v, want ErrUnauthorized", err)
+	}
+	// A bad sibling key must not break verification of a valid rotation key.
+	delete(v.PublicKeys, "bad-key")
+	v.PublicKeys["nil-key"] = nil
+	if _, err := v.VerifyTunnelToken(context.Background(), []byte(validTok), []string{"home.relay.test"}); err != nil {
+		t.Fatalf("valid key rejected with nil sibling: %v", err)
+	}
+}

@@ -109,16 +109,25 @@ const (
 	handshakeEntryTTL = 10 * time.Minute
 )
 
+const (
+	// maxHandshakeThrottleEntries bounds memory in handshakeThrottle.entries so
+	// rotating IPv6 /64 prefixes or botnet probes cannot grow the map without bound.
+	maxHandshakeThrottleEntries = 16384
+	handshakePruneInterval      = time.Second
+)
+
 // handshakeThrottle imposes a per-source backoff on repeated failed carrier
 // handshakes. It is keyed by remote IPv4 /32 or IPv6 /64 so an attacker cannot
 // dodge the penalty by re-dialing from fresh ephemeral ports or rotating IPv6
 // interface identifiers. A successful handshake clears the source's record;
 // idle records are pruned to bound memory.
 type handshakeThrottle struct {
-	mu      sync.Mutex
-	entries map[string]*throttleEntry
-	now     func() time.Time                     // injectable clock for deterministic tests
-	sleep   func(context.Context, time.Duration) // injectable sleeper for deterministic tests
+	mu         sync.Mutex
+	entries    map[string]*throttleEntry
+	maxEntries int
+	lastPrune  time.Time
+	now        func() time.Time                     // injectable clock for deterministic tests
+	sleep      func(context.Context, time.Duration) // injectable sleeper for deterministic tests
 }
 
 type throttleEntry struct {
@@ -128,9 +137,10 @@ type throttleEntry struct {
 
 func newHandshakeThrottle() *handshakeThrottle {
 	return &handshakeThrottle{
-		entries: make(map[string]*throttleEntry),
-		now:     time.Now,
-		sleep:   ctxSleep,
+		entries:    make(map[string]*throttleEntry),
+		maxEntries: maxHandshakeThrottleEntries,
+		now:        time.Now,
+		sleep:      ctxSleep,
 	}
 }
 
@@ -157,11 +167,18 @@ func (h *handshakeThrottle) backoffBefore(ctx context.Context, remote net.Addr) 
 	}
 	key := sourcePrefix(remote)
 	h.mu.Lock()
-	h.pruneLocked()
+	now := h.now()
+	if h.lastPrune.IsZero() || now.Sub(h.lastPrune) >= handshakePruneInterval {
+		h.pruneLocked(now)
+	}
 	e := h.entries[key]
 	var excess int
 	if e != nil {
-		excess = e.failures - handshakeFreeFailures
+		if e.last.Before(now.Add(-handshakeEntryTTL)) {
+			delete(h.entries, key)
+		} else {
+			excess = e.failures - handshakeFreeFailures
+		}
 	}
 	h.mu.Unlock()
 	if excess <= 0 {
@@ -182,13 +199,26 @@ func (h *handshakeThrottle) recordFailure(remote net.Addr) {
 	key := sourcePrefix(remote)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	now := h.now()
 	e := h.entries[key]
 	if e == nil {
+		capLimit := h.maxEntries
+		if capLimit <= 0 {
+			capLimit = maxHandshakeThrottleEntries
+		}
+		if len(h.entries) >= capLimit {
+			if h.lastPrune.IsZero() || now.Sub(h.lastPrune) >= handshakePruneInterval {
+				h.pruneLocked(now)
+			}
+			if len(h.entries) >= capLimit {
+				h.evictSampledOldestLocked()
+			}
+		}
 		e = &throttleEntry{}
 		h.entries[key] = e
 	}
 	e.failures++
-	e.last = h.now()
+	e.last = now
 }
 
 // recordSuccess clears a source's failure record after an authorized handshake.
@@ -216,11 +246,35 @@ func (h *handshakeThrottle) FailureCount(remote net.Addr) int {
 }
 
 // pruneLocked drops entries idle past the TTL. Caller holds h.mu.
-func (h *handshakeThrottle) pruneLocked() {
-	cutoff := h.now().Add(-handshakeEntryTTL)
+func (h *handshakeThrottle) pruneLocked(now time.Time) {
+	h.lastPrune = now
+	cutoff := now.Add(-handshakeEntryTTL)
 	for k, e := range h.entries {
 		if e.last.Before(cutoff) {
 			delete(h.entries, k)
 		}
+	}
+}
+
+// evictSampledOldestLocked removes the oldest entry from a bounded random
+// sample (O(1) under h.mu) to stay within maxEntries without scanning the
+// entire map on every failed handshake during a flood. Caller holds h.mu.
+func (h *handshakeThrottle) evictSampledOldestLocked() {
+	const sampleSize = 16
+	var oldestKey string
+	var oldestTime time.Time
+	seen := 0
+	for k, e := range h.entries {
+		if seen == 0 || e.last.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = e.last
+		}
+		seen++
+		if seen >= sampleSize {
+			break
+		}
+	}
+	if seen > 0 {
+		delete(h.entries, oldestKey)
 	}
 }

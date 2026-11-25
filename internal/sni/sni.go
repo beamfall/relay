@@ -175,6 +175,10 @@ func parseClientHello(handshake []byte) (string, error) {
 	}
 	extensions := body[pos : pos+extensionsLen]
 
+	var (
+		foundSNI bool
+		sniName  string
+	)
 	for len(extensions) >= 4 {
 		extType := binary.BigEndian.Uint16(extensions[0:2])
 		extLen := int(binary.BigEndian.Uint16(extensions[2:4]))
@@ -185,10 +189,23 @@ func parseClientHello(handshake []byte) (string, error) {
 		ext := extensions[:extLen]
 		extensions = extensions[extLen:]
 		if extType == 0 {
-			return parseServerNameExtension(ext)
+			if foundSNI {
+				// RFC 8446 §4.2 forbids duplicate extensions; rejecting a second
+				// server_name extension prevents parser-differential SNI smuggling.
+				return "", ErrNoSNI
+			}
+			name, err := parseServerNameExtension(ext)
+			if err != nil {
+				return "", err
+			}
+			foundSNI = true
+			sniName = name
 		}
 	}
-	return "", ErrNoSNI
+	if !foundSNI {
+		return "", ErrNoSNI
+	}
+	return sniName, nil
 }
 
 func parseServerNameExtension(ext []byte) (string, error) {
@@ -200,6 +217,10 @@ func parseServerNameExtension(ext []byte) (string, error) {
 		return "", ErrShortHello
 	}
 	names := ext[2 : 2+listLen]
+	var (
+		foundHost bool
+		hostName  string
+	)
 	for len(names) >= 3 {
 		nameType := names[0]
 		nameLen := int(binary.BigEndian.Uint16(names[1:3]))
@@ -208,15 +229,23 @@ func parseServerNameExtension(ext []byte) (string, error) {
 			return "", ErrShortHello
 		}
 		if nameType == 0 {
+			if foundHost {
+				// RFC 6066 §3 forbids duplicate host_name entries in server_name.
+				return "", ErrNoSNI
+			}
 			name := string(names[:nameLen])
 			if !validServerName(name) {
 				return "", ErrNoSNI
 			}
-			return strings.ToLower(name), nil
+			foundHost = true
+			hostName = strings.ToLower(name)
 		}
 		names = names[nameLen:]
 	}
-	return "", ErrNoSNI
+	if !foundHost {
+		return "", ErrNoSNI
+	}
+	return hostName, nil
 }
 
 func validServerName(name string) bool {

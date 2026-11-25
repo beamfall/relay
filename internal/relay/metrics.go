@@ -260,7 +260,9 @@ func (m *metrics) newForwardTimer(src io.Reader, direction string) *forwardTimer
 
 func (t *forwardTimer) Read(p []byte) (int, error) {
 	n, err := t.src.Read(p)
-	t.readAt = time.Now()
+	if t.latency != nil {
+		t.readAt = time.Now()
+	}
 	return n, err
 }
 

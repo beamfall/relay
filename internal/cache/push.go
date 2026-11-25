@@ -12,6 +12,14 @@ import (
 	"github.com/beamfall/relay/internal/protocol"
 )
 
+const (
+	// MaxSegmentBytes bounds a single cached media segment in RAM during push
+	// and pull so one oversized segment cannot buffer up to TenantCapBytes (25 GiB).
+	MaxSegmentBytes int64 = 64 * 1024 * 1024
+
+	rejectedPushDrainTimeout = 5 * time.Second
+)
+
 type PushRequest struct {
 	SegmentSetID string
 	Segment      string
@@ -189,7 +197,8 @@ func (h CarrierHandler) handlePush(ctx context.Context, rw io.ReadWriter, push *
 		_ = writeCacheAck(rw, PushAck{Status: "rejected", Error: "invalid_push"})
 		return
 	}
-	if push.Bytes < 0 || push.Bytes > h.Store.TenantCapBytes {
+	maxSeg := min(h.Store.TenantCapBytes, MaxSegmentBytes)
+	if push.Bytes < 0 || push.Bytes > maxSeg {
 		ack := h.ack(push.SegmentSetID, "rejected", ErrQuotaExceeded.Error())
 		_ = writeCacheAck(rw, ack)
 		return
@@ -198,8 +207,14 @@ func (h CarrierHandler) handlePush(ctx context.Context, rw io.ReadWriter, push *
 		// Drain the still-unread body before acking: closing on the deferred
 		// conn.Close() with unread bytes pending can RST the connection and
 		// lose this ack, wedging the peer's Push instead of returning
-		// "rate_limited" cleanly.
-		_, _ = io.Copy(io.Discard, io.LimitReader(rw, push.Bytes))
+		// "rate_limited" cleanly. Bound the drain with a short read deadline
+		// and skip draining if shutting down.
+		if ctx.Err() == nil {
+			if d, ok := rw.(interface{ SetReadDeadline(time.Time) error }); ok {
+				_ = d.SetReadDeadline(time.Now().Add(rejectedPushDrainTimeout))
+			}
+			_, _ = io.Copy(io.Discard, io.LimitReader(rw, push.Bytes))
+		}
 		_ = writeCacheAck(rw, PushAck{Status: "rejected", Error: "rate_limited"})
 		return
 	}
@@ -363,11 +378,8 @@ func (c CarrierClient) Pull(ctx context.Context, req PullRequest) (Entry, bool, 
 	if resp.Status != "found" {
 		return Entry{}, false, fmt.Errorf("cache pull rejected: %s", resp.Error)
 	}
-	// CarrierClient has no Store to check a tenant's actual cap against (it's
-	// the client side of a pull, not the handler); DefaultTenantCapBytes is
-	// the same hard ceiling Store falls back to, so an oversized or lying
-	// resp.Bytes still can't force an unbounded allocation here.
-	if resp.Bytes < 0 || resp.Bytes > DefaultTenantCapBytes {
+	// Bound single-segment RAM allocation independently of DefaultTenantCapBytes.
+	if resp.Bytes < 0 || resp.Bytes > MaxSegmentBytes {
 		return Entry{}, false, errors.New("invalid cache pull body")
 	}
 	body, err := io.ReadAll(io.LimitReader(stream, resp.Bytes))

@@ -476,6 +476,12 @@ func (c *Client) dialQUIC(ctx context.Context, attempt *carrierAttempt, token []
 	if ackContextErr != nil || ctx.Err() != nil {
 		return nil, nil, fmt.Errorf("read carrier ack: %w", firstContextError(ackContextErr, ctx.Err()))
 	}
+	if closer, ok := hsStream.(io.Closer); ok {
+		_ = closer.Close()
+	}
+	if canceler, ok := hsStream.(interface{ CancelRead(quic.StreamErrorCode) }); ok {
+		canceler.CancelRead(0)
+	}
 	return conn, conn.Session(), nil
 }
 

@@ -3,6 +3,11 @@ services:
     image: ghcr.io/beamfall/relay@sha256:${BEAMFALL_RELAY_DIGEST:?set the verified 64-hex release digest}
     container_name: beamfall-relayd
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     # Bounds container-log retention to the published operational-log retention window
     # (24h; see docs/relay-threat-model.md "Retention Bounds" and docs/operator-self-hosted-relay.md).
     # Without this, Docker's default json-file driver keeps logs unbounded, contradicting the

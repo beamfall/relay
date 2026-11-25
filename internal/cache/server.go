@@ -246,6 +246,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveEntry(w http.ResponseWriter, entry Entry) {
 	s.metrics.bytesServed.Add(int64(len(entry.Bytes)))
 	w.Header().Set("Content-Type", entry.ContentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "private, max-age=60")
 	_, _ = w.Write(entry.Bytes)
 }

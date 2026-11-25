@@ -700,6 +700,10 @@ func (s *Server) acceptCarriers(ctx context.Context) {
 			// holds only a pending admission, never a carrier slot
 			// (SECREV-RELAY-8), and ends early if the admission is evicted.
 			s.handshakeThrottle.backoffBefore(pendingCtx, conn.RemoteAddr())
+			if pendingCtx.Err() != nil {
+				_ = conn.Close()
+				return
+			}
 			s.handleCarrierConn(ctx, conn, endPending)
 		}()
 	}
@@ -837,24 +841,27 @@ func (s *Server) reserveCarrierSlot(rw protocol.FrameReadWriter) (func(), bool) 
 
 func (s *Server) handleCarrierConn(ctx context.Context, conn net.Conn, endPending func()) {
 	defer conn.Close() //nolint:errcheck // carrier connection cleanup.
-	// Bound the handshake: a carrier that connects and sends nothing must not
-	// hold a goroutine indefinitely. Mirrors the public SNI-peek deadline posture.
+	// Bound the handshake (both reads and writes): a carrier that connects and
+	// sends nothing—or advertises a zero TCP window during TLS handshake, error
+	// frames, or FrameAck—must not hold a goroutine or slot indefinitely.
 	if s.carrierHandshakeT > 0 {
-		_ = conn.SetReadDeadline(time.Now().Add(s.carrierHandshakeT))
+		_ = conn.SetDeadline(time.Now().Add(s.carrierHandshakeT))
 	}
 	verified, ok := s.carrierHandshake(ctx, conn, conn.RemoteAddr())
+	if !ok {
+		endPending()
+		return
+	}
+	releaseSlot, ok := s.reserveCarrierSlot(conn)
 	endPending()
 	if !ok {
 		return
 	}
-	releaseSlot, ok := s.reserveCarrierSlot(conn)
-	if !ok {
-		return
-	}
 	defer releaseSlot()
-	// Handshake frame read; clear the deadline so the long-lived yamux session
-	// is not subject to the handshake timeout.
-	_ = conn.SetReadDeadline(time.Time{})
+	// Handshake and slot reservation complete; clear both read and write
+	// deadlines before starting yamux so yamux's background send goroutine
+	// cannot race with or trip over the handshake write deadline.
+	_ = conn.SetDeadline(time.Time{})
 	session, err := yamux.Server(conn, protocol.YamuxConfig(s.yamuxStreamWindowBytes))
 	if err != nil {
 		s.metrics.handshakeFailures.Add(1)
@@ -901,6 +908,10 @@ func (s *Server) acceptQUICCarriers(ctx context.Context) {
 			// Back off a repeat-offender source before its handshake, holding no
 			// carrier slot (SECREV-RELAY-8). Mirrors acceptCarriers.
 			s.handshakeThrottle.backoffBefore(pendingCtx, conn.RemoteAddr())
+			if pendingCtx.Err() != nil {
+				_ = conn.CloseWithError(0, "")
+				return
+			}
 			s.handleQUICCarrierConn(ctx, conn, endPending)
 		}()
 	}
@@ -1023,12 +1034,12 @@ func (s *Server) handleQUICCarrierConn(ctx context.Context, conn *quic.Conn, end
 		}
 		return
 	}
-	// Bound the Hello/Ack frame read itself: AcceptStream only bounds how long
-	// we wait for the stream to open, so a peer that opens the stream and then
-	// sends a partial frame (or nothing) could otherwise hold the carrier slot
-	// indefinitely. Mirrors handleCarrierConn's TCP read-deadline posture.
+	// Bound the Hello/Ack frame exchange (both reads and writes): AcceptStream
+	// only bounds how long we wait for the stream to open, so a peer that opens
+	// the stream and then sends a partial frame or stalls on Ack could otherwise
+	// hold the carrier slot indefinitely.
 	if s.carrierHandshakeT > 0 {
-		_ = hsStream.SetReadDeadline(time.Now().Add(s.carrierHandshakeT))
+		_ = hsStream.SetDeadline(time.Now().Add(s.carrierHandshakeT))
 	}
 	verified, ok := s.carrierHandshake(ctx, hsStream, conn.RemoteAddr())
 	if !ok {
@@ -1037,15 +1048,12 @@ func (s *Server) handleQUICCarrierConn(ctx context.Context, conn *quic.Conn, end
 		lingerQUICRefusal(conn, hsStream)
 		return
 	}
-	endPending()
 	releaseSlot, ok := s.reserveCarrierSlot(hsStream)
+	endPending()
 	if !ok {
 		return
 	}
 	defer releaseSlot()
-	// Handshake frame read; clear the deadline so the long-lived stream is not
-	// subject to the handshake timeout.
-	_ = hsStream.SetReadDeadline(time.Time{})
 	session := protocol.NewQUICSession(conn)
 	s.serveCarrierSession(ctx, hsStream, session, verified)
 }
@@ -1244,7 +1252,7 @@ func (s *Server) serveCarrierSession(ctx context.Context, rw protocol.FrameReadW
 			s.logger.Warn("carrier host conflict", "id", verified.ID, "refused_hosts", refused, "reason", "already_claimed_by_live_carrier")
 		}
 	}
-	if err := protocol.WriteFrame(rw, protocol.Frame{Type: protocol.FrameAck, Ack: &protocol.Ack{
+	if err := s.writeAckFrame(rw, protocol.Frame{Type: protocol.FrameAck, Ack: &protocol.Ack{
 		Version:   protocol.Version,
 		CarrierID: verified.ID,
 		Hostnames: accepted,
@@ -1253,6 +1261,7 @@ func (s *Server) serveCarrierSession(ctx context.Context, rw protocol.FrameReadW
 		_ = session.Close()
 		return
 	}
+	finishHandshakeStream(rw)
 	// The carrier is public-route ready only after registration produced at
 	// least one route and the Ack completed. A connected carrier whose every
 	// requested hostname conflicted cannot satisfy readiness.
@@ -1283,7 +1292,7 @@ func (s *Server) serveCacheCarrierSession(ctx context.Context, rw protocol.Frame
 	if s.cacheCarriers != nil {
 		s.cacheCarriers.register(verified.ID, session)
 	}
-	if err := protocol.WriteFrame(rw, protocol.Frame{Type: protocol.FrameAck, Ack: &protocol.Ack{
+	if err := s.writeAckFrame(rw, protocol.Frame{Type: protocol.FrameAck, Ack: &protocol.Ack{
 		Version:              protocol.Version,
 		CarrierID:            verified.ID,
 		Hostnames:            verified.Hostnames,
@@ -1296,6 +1305,7 @@ func (s *Server) serveCacheCarrierSession(ctx context.Context, rw protocol.Frame
 		_ = session.Close()
 		return
 	}
+	finishHandshakeStream(rw)
 	s.metrics.nonServingCarriersConnected.Add(1)
 	defer func() {
 		s.metrics.nonServingCarriersConnected.Add(-1)
@@ -1776,15 +1786,51 @@ func (r *byteSliceReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// writeAckFrame writes FrameAck under a fresh handshake write deadline so a
+// carrier advertising a zero receive window cannot block FrameAck indefinitely,
+// without carrying an almost-expired Hello deadline into yamux startup.
+func (s *Server) writeAckFrame(rw protocol.FrameReadWriter, frame protocol.Frame) error {
+	if s.carrierHandshakeT > 0 {
+		if d, ok := rw.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = d.SetWriteDeadline(time.Now().Add(s.carrierHandshakeT))
+		}
+	}
+	return protocol.WriteFrame(rw, frame)
+}
+
+// finishHandshakeStream clears the handshake write deadline on rw after
+// FrameAck is written. On QUIC carriers, rw is the dedicated Hello/Ack stream
+// rather than the multiplexed connection, so it is also closed and read-canceled
+// immediately so a peer cannot pin up to QUICStreamReceiveWindowBytes (8 MiB)
+// of unread data outside streamSlots.
+func finishHandshakeStream(rw protocol.FrameReadWriter) {
+	if d, ok := rw.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = d.SetWriteDeadline(time.Time{})
+	}
+	if hs, ok := rw.(*quic.Stream); ok {
+		_ = hs.Close()
+		hs.CancelRead(0)
+	}
+}
+
 // errFairUseBound reports a chunk refused because forwarding it would exceed
 // the tunnel's fair-use crash-loss bound.
 var errFairUseBound = errors.New("relay: fair-use crash-loss bound reached")
+
+var spliceBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, fairUseCopyChunkMax)
+		return &buf
+	},
+}
 
 // copyWithLimit forwards src to dst in chunks of at most fairUseCopyChunkMax.
 // reserve, when set, admits each chunk before it is written; record, when set,
 // then receives the reserved and written byte counts, even for a failed write.
 func copyWithLimit(ctx context.Context, dst io.Writer, src io.Reader, limiter *byteLimiter, reserve func(int64) bool, record func(reserved, written int64)) (int64, error) {
-	buf := make([]byte, fairUseCopyChunkMax)
+	bufPtr := spliceBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer spliceBufPool.Put(bufPtr)
 	var written int64
 	for {
 		nr, er := src.Read(buf)

@@ -100,6 +100,14 @@ func (v *HostedTokenVerifier) Validate() error {
 	if v.NonceStore == nil {
 		return errors.New("hosted token verifier nonce store is required")
 	}
+	// Reject non-empty malformed keys at config validation time; nil/empty
+	// placeholders are tolerated here for claim-only unit tests and filtered
+	// out in verify() before delegating to ed25519.Verify.
+	for kid, pub := range v.PublicKeys {
+		if len(pub) > 0 && len(pub) != ed25519.PublicKeySize {
+			return fmt.Errorf("hosted token verifier public key %q has invalid length %d (want %d)", kid, len(pub), ed25519.PublicKeySize)
+		}
+	}
 	return nil
 }
 
@@ -134,12 +142,34 @@ func (v *HostedTokenVerifier) VerifyTunnelToken(ctx context.Context, token []byt
 }
 
 func (v *HostedTokenVerifier) verify(raw []byte) (hostedRelayClaims, error) {
+	// Guard against misconfigured public keys before delegating to
+	// relaytoken.Verify: crypto/ed25519.Verify panics on wrong key lengths.
+	// Fast path (zero-alloc) when every configured key is valid; otherwise
+	// filter to valid 32-byte keys so one bad entry cannot panic or break
+	// valid rotation siblings.
+	pubKeys := v.PublicKeys
+	allValid := true
+	for _, pub := range pubKeys {
+		if len(pub) != ed25519.PublicKeySize {
+			allValid = false
+			break
+		}
+	}
+	if !allValid {
+		filtered := make(map[string]ed25519.PublicKey, len(pubKeys))
+		for kid, pub := range pubKeys {
+			if len(pub) == ed25519.PublicKeySize {
+				filtered[kid] = pub
+			}
+		}
+		pubKeys = filtered
+	}
 	// Structure, EdDSA signature, canonical-JSON re-encode, token type, and the
 	// header.KeyID == claims.KeyID integrity check are all owned by the
 	// single-owner relaytoken module (ORG-14). relaytoken.ErrUnauthorized is
 	// mapped to this package's ErrUnauthorized so the transport contract is
 	// unchanged. Policy (issuer/audience/purpose/expiry/nonce) stays here.
-	claims, err := relaytoken.Verify(raw, v.PublicKeys)
+	claims, err := relaytoken.Verify(raw, pubKeys)
 	if err != nil {
 		return hostedRelayClaims{}, ErrUnauthorized
 	}

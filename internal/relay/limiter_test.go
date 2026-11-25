@@ -260,6 +260,33 @@ func TestHandshakeThrottlePrunesIdleEntries(t *testing.T) {
 	}
 }
 
+func TestHandshakeThrottleBoundsCardinality(t *testing.T) {
+	h := newHandshakeThrottle()
+	h.maxEntries = 3
+	now := time.Now()
+	h.now = func() time.Time { return now }
+
+	addrs := []fakeAddr{
+		"192.0.2.1:1",
+		"192.0.2.2:1",
+		"192.0.2.3:1",
+		"192.0.2.4:1",
+	}
+	for _, a := range addrs {
+		now = now.Add(time.Second)
+		h.recordFailure(a)
+	}
+	if got := len(h.entries); got != 3 {
+		t.Fatalf("entries len = %d, want 3", got)
+	}
+	if h.FailureCount(addrs[0]) != 0 {
+		t.Fatalf("oldest entry was not evicted: count = %d", h.FailureCount(addrs[0]))
+	}
+	if h.FailureCount(addrs[3]) != 1 {
+		t.Fatalf("newest entry missing: count = %d", h.FailureCount(addrs[3]))
+	}
+}
+
 // TestCtxSleepHonorsCancellation proves a backoff sleep returns promptly when
 // the context is cancelled, keeping shutdown prompt mid-backoff.
 func TestCtxSleepHonorsCancellation(t *testing.T) {

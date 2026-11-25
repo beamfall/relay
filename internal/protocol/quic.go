@@ -47,6 +47,7 @@ func QUICConfig() *quic.Config {
 		MaxStreamReceiveWindow:     QUICStreamReceiveWindowBytes,
 		MaxConnectionReceiveWindow: 64 * 1024 * 1024,
 		MaxIncomingStreams:         1024,
+		MaxIncomingUniStreams:      -1,
 		KeepAlivePeriod:            15 * time.Second,
 	}
 }

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/beamfall/relay/internal/protocol"
 	"github.com/hashicorp/yamux"
 )
 
@@ -169,6 +171,31 @@ func TestCarrierPullRoundTrip(t *testing.T) {
 	_ = serverSession.Close()
 	if err := <-errCh; err != nil {
 		t.Fatalf("serve: %v", err)
+	}
+}
+
+func TestCarrierPushRejectsOversizedSegment(t *testing.T) {
+	store, err := NewStore(t.TempDir(), testKey, DefaultTenantCapBytes)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	var buf bytes.Buffer
+	(CarrierHandler{Store: store}).handlePush(context.Background(), &buf, &protocol.CachePush{
+		SegmentSetID: "segset",
+		Segment:      "huge.m4s",
+		ContentType:  "video/mp4",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		Bytes:        MaxSegmentBytes + 1,
+	})
+	frame, err := protocol.ReadFrame(&buf)
+	if err != nil {
+		t.Fatalf("read ack frame: %v", err)
+	}
+	if frame.Type != protocol.FrameCacheAck || frame.CacheAck == nil {
+		t.Fatalf("frame = %#v, want FrameCacheAck", frame)
+	}
+	if frame.CacheAck.Status != "rejected" || frame.CacheAck.Error != ErrQuotaExceeded.Error() {
+		t.Fatalf("ack = %#v, want rejected/%s", frame.CacheAck, ErrQuotaExceeded)
 	}
 }
 

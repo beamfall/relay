@@ -68,13 +68,20 @@ type stallWriter struct {
 	conn    net.Conn
 	timeout time.Duration
 	stalled func()
+	lastSet time.Time
 }
 
 func (w *stallWriter) Write(p []byte) (int, error) {
 	written := 0
+	forceRefresh := false
+	refreshInterval := min(w.timeout/4, time.Second)
 	for {
-		if err := w.conn.SetWriteDeadline(time.Now().Add(w.timeout)); err != nil {
-			return written, err
+		now := time.Now()
+		if forceRefresh || w.lastSet.IsZero() || now.Sub(w.lastSet) >= refreshInterval {
+			if err := w.conn.SetWriteDeadline(now.Add(w.timeout)); err != nil {
+				return written, err
+			}
+			w.lastSet = now
 		}
 		n, err := w.conn.Write(p[written:])
 		written += n
@@ -90,5 +97,7 @@ func (w *stallWriter) Write(p []byte) (int, error) {
 			}
 			return written, err
 		}
+		// Partial progress before the deadline fired: grant a fresh timeout.
+		forceRefresh = true
 	}
 }

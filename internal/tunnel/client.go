@@ -21,6 +21,10 @@ const (
 	defaultBackoffMax  = 60 * time.Second
 	defaultMaxStreams  = 64
 	streamDrainTimeout = 5 * time.Second
+	// abruptStreamAbortDeadline bounds teardown when one direction of a relayed
+	// stream ends with an error rather than a clean EOF, matching relay.Server.splice.
+	abruptStreamAbortDeadline = 500 * time.Millisecond
+	tunnelCopyBufSize         = 32 * 1024
 	// defaultBackendDialTimeout bounds the dial to cfg.BackendAddr so a
 	// blackholed backend can't wedge a handleStream goroutine (and its slots
 	// semaphore entry) for the OS connect timeout, unresponsive to shutdown.
@@ -741,6 +745,13 @@ func (c *Client) watchStreamDrain(streams *sessionStreams) {
 	}()
 }
 
+var tunnelCopyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, tunnelCopyBufSize)
+		return &buf
+	},
+}
+
 func (c *Client) handleStream(ctx context.Context, stream net.Conn, streams *sessionStreams) {
 	defer stream.Close() //nolint:errcheck // stream cleanup after bidirectional copy.
 	dialer := net.Dialer{Timeout: defaultBackendDialTimeout}
@@ -756,30 +767,46 @@ func (c *Client) handleStream(ctx context.Context, stream net.Conn, streams *ses
 		return
 	}
 	done := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(backend, stream)
-		protocol.HalfCloseWrite(backend)
+	copyDir := func(dst, src net.Conn) {
+		bufPtr := tunnelCopyBufPool.Get().(*[]byte)
+		// Hide io.ReaderFrom / io.WriterTo (implemented by *net.TCPConn) so
+		// io.CopyBuffer actually uses the pooled buffer instead of falling back
+		// to net.genericReadFrom/genericWriteTo, which allocates a fresh 32 KiB
+		// slice per stream when the other side is a yamux/QUIC stream.
+		_, err := io.CopyBuffer(struct{ io.Writer }{dst}, struct{ io.Reader }{src}, *bufPtr)
+		tunnelCopyBufPool.Put(bufPtr)
+		if err == nil {
+			protocol.HalfCloseWrite(dst)
+		}
 		done <- err
-	}()
-	go func() {
-		_, err := io.Copy(stream, backend)
-		protocol.HalfCloseWrite(stream)
-		done <- err
-	}()
+	}
+	go copyDir(backend, stream)
+	go copyDir(stream, backend)
 	// Wait for BOTH directions to finish on normal completion. A backend (or
 	// public client) that half-closes its write side makes one copy hit EOF
 	// first; returning then would let the deferred close tear down the still-
-	// active direction and truncate it. Each copy half-closes its destination via
-	// protocol.HalfCloseWrite, so the half-close propagates without us cutting the
-	// live direction. ctx.Done() still wins immediately so cancellation/shutdown
-	// tears the stream down promptly.
+	// active direction and truncate it. On an abrupt error (e.g. reset or
+	// relay stall eviction), abort both sides with a short deadline so the
+	// surviving copy goroutine cannot wedge and leak a maxStreams slot.
 	for i := 0; i < 2; i++ {
 		select {
 		case <-ctx.Done():
+			deadline := time.Now().Add(abruptStreamAbortDeadline)
+			_ = stream.SetDeadline(deadline)
+			_ = backend.SetDeadline(deadline)
+			protocol.AbortStream(stream)
+			protocol.AbortStream(backend)
 			return
 		case err := <-done:
 			if err != nil {
 				c.logger.Debug("tunnel stream copy ended abruptly", "err", err, "streams", streams.count())
+				if i == 0 {
+					deadline := time.Now().Add(abruptStreamAbortDeadline)
+					_ = stream.SetDeadline(deadline)
+					_ = backend.SetDeadline(deadline)
+					protocol.AbortStream(stream)
+					protocol.AbortStream(backend)
+				}
 			}
 		}
 	}

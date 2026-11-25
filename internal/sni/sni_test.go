@@ -170,6 +170,45 @@ func TestPeekClientHelloRejectsOversizedHello(t *testing.T) {
 	}
 }
 
+func TestParseClientHelloRejectsDuplicateSNIExtensionAndHostName(t *testing.T) {
+	sniExt := func(names ...string) []byte {
+		var list []byte
+		for _, n := range names {
+			list = append(list, 0x00)
+			list = append(list, uint16be(len(n))...)
+			list = append(list, n...)
+		}
+		ext := append(uint16be(len(list)), list...)
+		out := []byte{0x00, 0x00}
+		out = append(out, uint16be(len(ext))...)
+		return append(out, ext...)
+	}
+	wrapHello := func(exts []byte) []byte {
+		var body []byte
+		body = append(body, 0x03, 0x03)             // legacy_version
+		body = append(body, make([]byte, 32)...)    // random
+		body = append(body, 0x00)                   // session_id len
+		body = append(body, 0x00, 0x02, 0x13, 0x01) // cipher_suites
+		body = append(body, 0x01, 0x00)             // compression_methods
+		body = append(body, uint16be(len(exts))...) // extensions_len
+		body = append(body, exts...)
+		hs := []byte{0x01, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}
+		return append(hs, body...)
+	}
+
+	// Duplicate server_name extension (RFC 8446 §4.2 violation).
+	dupExt := append(sniExt("a.relay.test"), sniExt("b.relay.test")...)
+	if _, err := parseClientHello(wrapHello(dupExt)); !errors.Is(err, ErrNoSNI) {
+		t.Fatalf("duplicate SNI extension err = %v, want ErrNoSNI", err)
+	}
+
+	// Duplicate host_name entry inside one server_name extension (RFC 6066 §3 violation).
+	dupName := sniExt("a.relay.test", "b.relay.test")
+	if _, err := parseClientHello(wrapHello(dupName)); !errors.Is(err, ErrNoSNI) {
+		t.Fatalf("duplicate host_name entry err = %v, want ErrNoSNI", err)
+	}
+}
+
 type readDeadlineConn struct {
 	io.Reader
 }
