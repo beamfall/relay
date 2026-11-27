@@ -14,4 +14,4 @@
 
 - [x] 3.1 Regression tests for cache carrier refusal, supersede, key pruning, oversized read rejection, streamed HTTP serving, connection cap, and concurrent cross-tenant reads
 - [x] 3.2 Run `gofmt`, `go vet`, `golangci-lint`, `private-pointer-scan`, `verify-vectors`, `openspec validate --all --strict`, and `go test -race ./...`
-- [ ] 3.3 Archive OpenSpec change after landing
+- [x] 3.3 Archive OpenSpec change after landing
