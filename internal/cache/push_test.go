@@ -199,6 +199,64 @@ func TestCarrierPushRejectsOversizedSegment(t *testing.T) {
 	}
 }
 
+func TestCarrierPullRejectsOversizedSegment(t *testing.T) {
+	clientSession, serverSession := cacheCarrierPair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		conn, err := serverSession.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck // test cleanup.
+		if _, err := protocol.ReadFrame(conn); err != nil {
+			return
+		}
+		_ = writeCachePullResponse(conn, protocol.CachePullResponse{
+			Status:      "found",
+			ContentType: "video/mp4",
+			ExpiresAt:   time.Now().Add(time.Hour),
+			Bytes:       MaxSegmentBytes + 1,
+		})
+	}()
+
+	_, ok, err := (CarrierClient{Session: clientSession}).Pull(ctx, PullRequest{
+		SegmentSetID: "segset",
+		Segment:      "huge.m4s",
+	})
+	if err == nil || ok {
+		t.Fatalf("pull oversized = ok=%v err=%v, want error", ok, err)
+	}
+	_ = clientSession.Close()
+	_ = serverSession.Close()
+}
+
+func TestCarrierPushTruncatedBodyRejectedCleanly(t *testing.T) {
+	store, err := NewStore(t.TempDir(), testKey, 4096)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	var rw bytes.Buffer
+	rw.WriteString("short")
+	(CarrierHandler{Store: store}).handlePush(context.Background(), &rw, &protocol.CachePush{
+		SegmentSetID: "segset",
+		Segment:      "0001.m4s",
+		ContentType:  "video/mp4",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		Bytes:        64,
+	})
+	frame, err := protocol.ReadFrame(&rw)
+	if err != nil {
+		t.Fatalf("read ack frame: %v", err)
+	}
+	if frame.Type != protocol.FrameCacheAck || frame.CacheAck == nil ||
+		frame.CacheAck.Status != "rejected" || frame.CacheAck.Error != "invalid_push" {
+		t.Fatalf("ack = %#v, want rejected/invalid_push", frame.CacheAck)
+	}
+	assertNoValidTransactions(t, store.tenantDir("segset"))
+}
+
 func TestCarrierPushQuotaAckRejectsWithoutEvicting(t *testing.T) {
 	clientSession, serverSession := cacheCarrierPair(t)
 	store, err := NewStore(t.TempDir(), testKey, 512)

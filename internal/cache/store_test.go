@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1003,5 +1004,120 @@ func TestAmortizedSweepReclaimsColdTenantNeverRead(t *testing.T) {
 	}
 	if _, err := os.Stat(coldMeta); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("cold tenant meta still present after amortized sweep: err=%v", err)
+	}
+}
+
+func TestStoreGetAndOpenRejectOversizedBlob(t *testing.T) {
+	store, err := NewStore(t.TempDir(), testKey, DefaultTenantCapBytes)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.Put("segset", "0001.m4s", Entry{
+		Bytes: []byte("seed"), ContentType: "video/mp4", ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("seed put: %v", err)
+	}
+	blobPath := store.blobPath("segset", "0001.m4s")
+	f, err := os.OpenFile(blobPath, os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open blob: %v", err)
+	}
+	if err := f.Truncate(MaxSegmentBytes + 1); err != nil {
+		_ = f.Close()
+		t.Fatalf("truncate sparse blob: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close blob: %v", err)
+	}
+
+	if _, _, err := store.Get("segset", "0001.m4s"); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("Store.Get err = %v, want size-limit error", err)
+	}
+	if stream, ok, err := store.Open("segset", "0001.m4s"); err == nil || !strings.Contains(err.Error(), "limit") {
+		if ok && stream.Body != nil {
+			_ = stream.Body.Close()
+		}
+		t.Fatalf("Store.Open err = %v, want size-limit error", err)
+	}
+}
+
+func TestStoreConcurrentReadsAcrossTenantsDoNotSerialize(t *testing.T) {
+	store, err := NewStore(t.TempDir(), testKey, 1<<20)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	expires := time.Now().Add(time.Hour)
+	for _, tenant := range []string{"home-a", "home-b"} {
+		if err := store.Put(tenant, "0001.m4s", Entry{
+			Bytes: []byte("payload-" + tenant), ContentType: "video/mp4", ExpiresAt: expires,
+		}); err != nil {
+			t.Fatalf("put %s: %v", tenant, err)
+		}
+	}
+
+	inHomeA := make(chan struct{})
+	releaseHomeA := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseHomeA) }) }
+	defer release()
+
+	var hookCalls sync.Mutex
+	homeAHooked := false
+	store.onReadBlob = func() {
+		hookCalls.Lock()
+		first := !homeAHooked
+		homeAHooked = true
+		hookCalls.Unlock()
+		if first {
+			close(inHomeA)
+			<-releaseHomeA
+		}
+	}
+
+	type readRes struct {
+		body string
+		err  error
+	}
+	homeADone := make(chan readRes, 1)
+	go func() {
+		stream, ok, err := store.Open("home-a", "0001.m4s")
+		if err != nil || !ok {
+			homeADone <- readRes{err: fmt.Errorf("home-a open: ok=%v err=%w", ok, err)}
+			return
+		}
+		defer stream.Body.Close() //nolint:errcheck // test cleanup.
+		b, err := io.ReadAll(stream.Body)
+		homeADone <- readRes{body: string(b), err: err}
+	}()
+
+	select {
+	case <-inHomeA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("home-a read did not enter shared lock window")
+	}
+
+	homeBDone := make(chan readRes, 1)
+	go func() {
+		entry, ok, err := store.Get("home-b", "0001.m4s")
+		if err != nil || !ok {
+			homeBDone <- readRes{err: fmt.Errorf("home-b get: ok=%v err=%w", ok, err)}
+			return
+		}
+		homeBDone <- readRes{body: string(entry.Bytes)}
+	}()
+
+	select {
+	case res := <-homeBDone:
+		if res.err != nil || res.body != "payload-home-b" {
+			t.Fatalf("home-b concurrent read = %#v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("home-b read serialized behind home-a read (root lock is still exclusive)")
+	}
+
+	release()
+	resA := <-homeADone
+	if resA.err != nil || resA.body != "payload-home-a" {
+		t.Fatalf("home-a read = %#v", resA)
 	}
 }

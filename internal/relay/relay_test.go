@@ -408,8 +408,9 @@ func TestRelayCacheVerificationKeysOverlapThroughTunnelReconnect(t *testing.T) {
 	defer home.Close()
 
 	node := startRelay(t, ctx, relay.Config{
-		TokenVerifier: expiringSurfaceVerifier{},
-		StreamCap:     8,
+		TokenVerifier:       expiringSurfaceVerifier{},
+		StreamCap:           8,
+		CacheCarrierEnabled: true,
 	})
 	defer node.Close()
 
@@ -470,8 +471,9 @@ func TestRelayPullsCacheMissThroughAuthenticatedCacheCarrier(t *testing.T) {
 	defer home.Close()
 
 	node := startRelay(t, ctx, relay.Config{
-		TokenVerifier: stableSurfaceVerifier{},
-		StreamCap:     8,
+		TokenVerifier:       stableSurfaceVerifier{},
+		StreamCap:           8,
+		CacheCarrierEnabled: true,
 	})
 	defer node.Close()
 
@@ -530,8 +532,9 @@ func TestRelayPullsCacheMissThroughRequestedAuthenticatedCarrier(t *testing.T) {
 	defer home.Close()
 
 	node := startRelay(t, ctx, relay.Config{
-		TokenVerifier: dualCacheSurfaceVerifier{},
-		StreamCap:     8,
+		TokenVerifier:       dualCacheSurfaceVerifier{},
+		StreamCap:           8,
+		CacheCarrierEnabled: true,
 	})
 	defer node.Close()
 
@@ -603,6 +606,64 @@ func TestRelayPullsCacheMissThroughRequestedAuthenticatedCarrier(t *testing.T) {
 	if _, ok, err := node.PullCacheSegment(ctx, cache.PullRequest{CarrierID: "missing-carrier", SegmentSetID: "segset", Segment: "0001.m4s"}); err != nil || ok {
 		t.Fatalf("missing carrier pull = ok %v err %v, want miss without error", ok, err)
 	}
+}
+
+func TestRelayRefusesCacheSurfaceByDefault(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	home := startHomeTLSEcho(t, testHost)
+	defer home.Close()
+
+	node := startRelay(t, ctx, relay.Config{
+		AdminAddr:       "127.0.0.1:0",
+		TokenVerifier:   stableSurfaceVerifier{},
+		StreamCap:       8,
+		MaxCarrierConns: 1,
+	})
+	defer node.Close()
+
+	conn := dialCarrier(t, node.CarrierAddr())
+	defer conn.Close() //nolint:errcheck // test cleanup.
+	if err := protocol.WriteFrame(conn, protocol.Frame{
+		Type: protocol.FrameHello,
+		Hello: &protocol.Hello{
+			Version:              protocol.Version,
+			Token:                []byte("cache-token"),
+			Hostnames:            []string{testHost},
+			Surface:              protocol.SurfaceCache,
+			CacheProtocolVersion: protocol.CacheProtocolVersion,
+			CacheVerificationKey: cacheVerificationKey(1),
+		},
+	}); err != nil {
+		t.Fatalf("write cache hello: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	frame, err := protocol.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("read cache refusal frame: %v", err)
+	}
+	if frame.Type != protocol.FrameError || frame.Error != "invalid hello" {
+		t.Fatalf("cache refusal frame = %+v, want invalid hello error", frame)
+	}
+
+	token := mintCacheToken(t, cacheVerificationKey(1))
+	if _, err := node.VerifyCacheAccessToken(ctx, "carrier-1", token); err != cache.ErrUnauthorized {
+		t.Fatalf("VerifyCacheAccessToken err = %v, want ErrUnauthorized", err)
+	}
+
+	body := getMetrics(t, node.AdminAddr())
+	if !strings.Contains(body, "beamfall_relay_handshake_failures_total 1\n") {
+		t.Fatalf("expected handshake_failures_total 1 in metrics:\n%s", body)
+	}
+	if !strings.Contains(body, "beamfall_relay_carriers_connected 0\n") {
+		t.Fatalf("expected carriers_connected 0 in metrics:\n%s", body)
+	}
+
+	// Passthrough still connects and takes the single MaxCarrierConns=1 slot,
+	// proving the refused cache carrier did not leak a carrier slot.
+	client := startTunnelClient(t, ctx, node.CarrierAddr(), home.Addr(), []byte("passthrough-token"), []string{testHost})
+	defer client.Close()
 }
 
 func fixedCachePuller(body string) cache.PullFetcher {

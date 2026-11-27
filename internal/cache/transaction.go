@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,6 +77,14 @@ func transactionCommitted(err error) bool {
 }
 
 func (s *Store) stageTransaction(tenantDir, blobName string, blob, meta []byte, oldBlobSHA, oldMetaSHA string) (cacheTxn, string, error) {
+	return s.stageTransactionStream(
+		tenantDir, blobName, int64(len(blob)), bytes.NewReader(blob),
+		func(string) ([]byte, error) { return meta, nil },
+		oldBlobSHA, oldMetaSHA,
+	)
+}
+
+func (s *Store) stageTransactionStream(tenantDir, blobName string, blobSize int64, blob io.Reader, buildMeta func(blobSHA256 string) ([]byte, error), oldBlobSHA, oldMetaSHA string) (cacheTxn, string, error) {
 	if err := s.verifyTenantDir(tenantDir); err != nil {
 		return cacheTxn{}, "", err
 	}
@@ -86,7 +96,6 @@ func (s *Store) stageTransaction(tenantDir, blobName string, blob, meta []byte, 
 		Version: cacheTxnVersion, ID: hex.EncodeToString(nonce[:]),
 		TenantHash:  filepath.Base(tenantDir),
 		SegmentHash: strings.TrimSuffix(blobName, ".bin"), Phase: phaseStaging,
-		NewBlobSHA256: fileDigest(blob), NewMetaSHA256: fileDigest(meta),
 		OldBlobSHA256: oldBlobSHA, OldMetaSHA256: oldMetaSHA,
 		BlobCreatedByTxn: oldBlobSHA == "", MetaCreatedByTxn: oldMetaSHA == "",
 	}
@@ -97,11 +106,21 @@ func (s *Store) stageTransaction(tenantDir, blobName string, blob, meta []byte, 
 	if err := s.syncMutation("create-transaction", tenantDir, txnDir); err != nil {
 		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, err)
 	}
-	if err := s.writeJournal(tenantDir, txnDir, &txn, phaseStaging); err != nil {
+	blobSHA, err := s.writeDurableStream(filepath.Join(txnDir, "new.bin"), blobSize, blob)
+	if err != nil {
+		if errors.Is(err, errShortPushBody) {
+			return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, err)
+		}
+		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, fmt.Errorf("stage cache segment: %w", err))
+	}
+	meta, err := buildMeta(blobSHA)
+	if err != nil {
 		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, err)
 	}
-	if err := s.writeDurable(filepath.Join(txnDir, "new.bin"), blob); err != nil {
-		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, fmt.Errorf("stage cache segment: %w", err))
+	txn.NewBlobSHA256 = blobSHA
+	txn.NewMetaSHA256 = fileDigest(meta)
+	if err := s.writeJournal(tenantDir, txnDir, &txn, phaseStaging); err != nil {
+		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, err)
 	}
 	if err := s.syncMutation("stage-blob", tenantDir, txnDir); err != nil {
 		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, err)
@@ -376,7 +395,7 @@ func (s *Store) inspectTransaction(tenantDir, txnDir string, txn cacheTxn) (txnS
 	}
 	nodes := make([]nodeState, len(paths))
 	for i, path := range paths {
-		node, err := s.readNode(path, s.nodeLimit(path))
+		node, err := s.statAndHashNode(path, s.nodeLimit(path))
 		if err != nil {
 			return txnSnapshot{}, err
 		}
@@ -389,7 +408,7 @@ func (s *Store) inspectTransaction(tenantDir, txnDir string, txn cacheTxn) (txnS
 }
 
 func (s *Store) validateNewPair(txnDir string, txn cacheTxn) error {
-	blob, err := s.readNode(filepath.Join(txnDir, "new.bin"), s.TenantCapBytes)
+	blob, err := s.statAndHashNode(filepath.Join(txnDir, "new.bin"), s.maxBlobBytes())
 	if err != nil {
 		return err
 	}
@@ -529,7 +548,7 @@ func (s *Store) nodeLimit(path string) int64 {
 }
 
 func (s *Store) renameRequired(from, to string) error {
-	if _, err := s.readNode(from, s.nodeLimit(from)); err != nil {
+	if _, err := s.statAndHashNode(from, s.nodeLimit(from)); err != nil {
 		return err
 	}
 	return s.renamePath(from, to)

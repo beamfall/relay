@@ -21,6 +21,10 @@ import (
 	"github.com/beamfall/relay/internal/config"
 )
 
+// DefaultMaxConns is the default concurrent connection cap on the cache-serve
+// HTTPS listener.
+const DefaultMaxConns = 1024
+
 type Config struct {
 	Addr              string
 	AdminAddr         string
@@ -29,6 +33,7 @@ type Config struct {
 	TLSConfig         *tls.Config
 	TokenVerifier     TokenVerifier
 	Store             *Store
+	MaxConns          int
 	PrewarmSignal     PrewarmSignal
 	PullThrough       PullFetcher
 	PullWaitTimeout   time.Duration
@@ -91,13 +96,15 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.PullWaitTimeout <= 0 {
 		cfg.PullWaitTimeout = 5 * time.Second
 	}
+	if cfg.MaxConns <= 0 {
+		cfg.MaxConns = DefaultMaxConns
+	}
 
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("listen cache: %w", err)
 	}
 	s := &Server{
-		listener:      tls.NewListener(ln, cfg.TLSConfig),
 		verifier:      cfg.TokenVerifier,
 		store:         cfg.Store,
 		prewarmSignal: cfg.PrewarmSignal,
@@ -106,6 +113,10 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		headroom:      cfg.PrefetchHeadroom,
 		logger:        cfg.Logger,
 	}
+	s.listener = tls.NewListener(
+		newCappedListener(ln, cfg.MaxConns, func() { s.metrics.connectionsOverCap.Add(1) }),
+		cfg.TLSConfig,
+	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cache/v1/segments/", s.handleSegment)
 	s.httpServer = &http.Server{
@@ -223,7 +234,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	segment := strings.TrimPrefix(r.URL.Path, "/cache/v1/segments/")
-	entry, ok, err := s.store.Get(access.SegmentSetID, segment)
+	stream, ok, err := s.store.Open(access.SegmentSetID, segment)
 	if err != nil {
 		s.metrics.errors.Add(1)
 		http.Error(w, "cache error", http.StatusInternalServerError)
@@ -239,8 +250,9 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	defer stream.Body.Close() //nolint:errcheck // read stream cleanup.
 	s.metrics.hits.Add(1)
-	s.serveEntry(w, entry)
+	s.serveStream(w, stream)
 }
 
 func (s *Server) serveEntry(w http.ResponseWriter, entry Entry) {
@@ -249,6 +261,17 @@ func (s *Server) serveEntry(w http.ResponseWriter, entry Entry) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "private, max-age=60")
 	_, _ = w.Write(entry.Bytes)
+}
+
+func (s *Server) serveStream(w http.ResponseWriter, entry StreamEntry) {
+	w.Header().Set("Content-Type", entry.ContentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, max-age=60")
+	w.Header().Set("Content-Length", strconv.FormatInt(entry.Size, 10))
+	bufPtr := cacheCopyBufPool.Get().(*[]byte)
+	written, _ := io.CopyBuffer(w, entry.Body, *bufPtr)
+	cacheCopyBufPool.Put(bufPtr)
+	s.metrics.bytesServed.Add(written)
 }
 
 func (s *Server) pullSegment(ctx context.Context, miss Miss, prefetch bool) (Entry, bool) {
@@ -462,15 +485,61 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "beamfall_cache_errors_total %d\n", s.metrics.errors.Load())
 	_, _ = fmt.Fprintf(w, "beamfall_cache_bytes_served_total %d\n", s.metrics.bytesServed.Load())
 	_, _ = fmt.Fprintf(w, "beamfall_cache_quota_exceeded_total %d\n", s.metrics.quotaExceeded.Load())
+	_, _ = fmt.Fprintf(w, "beamfall_cache_connections_over_cap_total %d\n", s.metrics.connectionsOverCap.Load())
 }
 
 type metrics struct {
-	hits          atomic.Int64
-	misses        atomic.Int64
-	unauthorized  atomic.Int64
-	errors        atomic.Int64
-	bytesServed   atomic.Int64
-	quotaExceeded atomic.Int64
+	hits               atomic.Int64
+	misses             atomic.Int64
+	unauthorized       atomic.Int64
+	errors             atomic.Int64
+	bytesServed        atomic.Int64
+	quotaExceeded      atomic.Int64
+	connectionsOverCap atomic.Int64
+}
+
+type cappedListener struct {
+	net.Listener
+	slots    chan struct{}
+	onReject func()
+}
+
+func newCappedListener(ln net.Listener, maxConns int, onReject func()) net.Listener {
+	return &cappedListener{
+		Listener: ln,
+		slots:    make(chan struct{}, maxConns),
+		onReject: onReject,
+	}
+}
+
+func (l *cappedListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.slots <- struct{}{}:
+			return &cappedConn{Conn: conn, release: func() { <-l.slots }}, nil
+		default:
+			if l.onReject != nil {
+				l.onReject()
+			}
+			_ = conn.Close()
+		}
+	}
+}
+
+type cappedConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *cappedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
 }
 
 func requireBearerToken(token string, next http.Handler) http.Handler {

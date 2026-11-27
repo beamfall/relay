@@ -1,9 +1,11 @@
 package cache
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -26,15 +28,16 @@ var ErrQuotaExceeded = errors.New("quota_exceeded")
 var ErrStoreClosed = errors.New("cache store is closed")
 
 type Store struct {
-	Root           string
-	Key            []byte
-	TenantCapBytes int64
-	now            func() time.Time
-	rootDir        *os.File
-	rootInfo       os.FileInfo
+	Root            string
+	Key             []byte
+	TenantCapBytes  int64
+	MaxSegmentBytes int64
+	now             func() time.Time
+	rootDir         *os.File
+	rootInfo        os.FileInfo
 
 	locksMu sync.Mutex
-	locks   map[string]*sync.Mutex
+	locks   map[string]*sync.RWMutex
 	usage   *sharedUsageCache
 
 	lifecycleMu sync.Mutex
@@ -55,15 +58,54 @@ type Store struct {
 	// sweep deterministically.
 	sweepDone chan struct{}
 
-	// failStep and leaveFailedTransaction are test-only fault injection.
+	// failStep, leaveFailedTransaction, and onReadBlob are test-only hooks.
 	failStep               func(string) error
 	leaveFailedTransaction bool
+	onReadBlob             func()
 }
 
 type Entry struct {
 	Bytes       []byte
 	ContentType string
 	ExpiresAt   time.Time
+}
+
+type StreamEntry struct {
+	Body        io.ReadCloser
+	Size        int64
+	ContentType string
+	ExpiresAt   time.Time
+}
+
+type segmentStream struct {
+	file      *os.File
+	limited   io.Reader
+	store     *Store
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (s *segmentStream) Read(p []byte) (int, error) {
+	return s.limited.Read(p)
+}
+
+func (s *segmentStream) Close() error {
+	s.closeOnce.Do(func() {
+		s.closeErr = s.file.Close()
+		s.store.endOperation()
+	})
+	return s.closeErr
+}
+
+func (s *Store) maxBlobBytes() int64 {
+	capBytes := MaxSegmentBytes
+	if s.MaxSegmentBytes > 0 {
+		capBytes = s.MaxSegmentBytes
+	}
+	if s.TenantCapBytes > 0 && s.TenantCapBytes < capBytes {
+		return s.TenantCapBytes
+	}
+	return capBytes
 }
 
 type QuotaState struct {
@@ -181,79 +223,184 @@ func DefaultTenantCap(root string) (int64, error) {
 }
 
 func (s *Store) Get(segmentSetID, segment string) (Entry, bool, error) {
-	if err := s.beginOperation(); err != nil {
-		return Entry{}, false, err
+	stream, ok, err := s.Open(segmentSetID, segment)
+	if err != nil || !ok {
+		return Entry{}, ok, err
 	}
-	defer s.endOperation()
+	defer stream.Body.Close() //nolint:errcheck // read cleanup.
+	body := make([]byte, stream.Size)
+	if _, err := io.ReadFull(stream.Body, body); err != nil {
+		return Entry{}, false, fmt.Errorf("read cache segment: %w", err)
+	}
+	return Entry{
+		Bytes:       body,
+		ContentType: stream.ContentType,
+		ExpiresAt:   stream.ExpiresAt,
+	}, true, nil
+}
+
+// Open validates metadata and blob integrity under a shared root lock (LOCK_SH)
+// and returns a streaming reader over the verified file descriptor, falling back
+// to an exclusive lock (LOCK_EX) only when transaction recovery or eviction is
+// needed.
+func (s *Store) Open(segmentSetID, segment string) (StreamEntry, bool, error) {
+	if err := s.beginOperation(); err != nil {
+		return StreamEntry{}, false, err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			s.endOperation()
+		}
+	}()
 	if err := validateSegmentSetID(segmentSetID); err != nil {
-		return Entry{}, false, err
+		return StreamEntry{}, false, err
 	}
 	if err := validateSegmentName(segment); err != nil {
-		return Entry{}, false, err
+		return StreamEntry{}, false, err
+	}
+	now := time.Now
+	if s.now != nil {
+		now = s.now
 	}
 	tenantDir := s.tenantDir(segmentSetID)
 	lock := s.tenantLock(tenantDir)
+
+	entry, ok, needExclusive, err := s.openShared(lock, tenantDir, segmentSetID, segment, now())
+	if err != nil {
+		return StreamEntry{}, false, err
+	}
+	if !needExclusive {
+		if ok {
+			transferred = true
+		}
+		return entry, ok, nil
+	}
+
+	entry, ok, err = s.openExclusive(lock, tenantDir, segmentSetID, segment, now())
+	if err != nil {
+		return StreamEntry{}, false, err
+	}
+	if ok {
+		transferred = true
+	}
+	return entry, ok, nil
+}
+
+func (s *Store) openShared(lock *sync.RWMutex, tenantDir, segmentSetID, segment string, now time.Time) (StreamEntry, bool, bool, error) {
+	lock.RLock()
+	defer lock.RUnlock()
+	rootLock, err := s.lockRootShared()
+	if err != nil {
+		return StreamEntry{}, false, false, err
+	}
+	defer unlockRoot(rootLock)
+
+	tenant, err := s.openTenantDir(tenantDir, false)
+	if errors.Is(err, syscall.ENOENT) || errors.Is(err, os.ErrNotExist) {
+		return StreamEntry{}, false, false, nil
+	}
+	if err != nil {
+		return StreamEntry{}, false, false, err
+	}
+	defer tenant.close()
+	hasTxn, err := s.hasTransactionEntries(tenantDir)
+	if err != nil {
+		return StreamEntry{}, false, false, err
+	}
+	if hasTxn {
+		return StreamEntry{}, false, true, nil
+	}
+	if err := tenant.verify(); err != nil {
+		return StreamEntry{}, false, false, err
+	}
+	meta, err := s.readStoredMeta(s.metaPath(segmentSetID, segment))
+	if errors.Is(err, os.ErrNotExist) {
+		return StreamEntry{}, false, false, nil
+	}
+	if err != nil {
+		return StreamEntry{}, false, false, err
+	}
+	if meta.Segment != segment || meta.BlobSHA256 == "" || !meta.ExpiresAt.After(now) {
+		return StreamEntry{}, false, true, nil
+	}
+	if s.onReadBlob != nil {
+		s.onReadBlob()
+	}
+	file, size, exists, digestMatch, err := s.openVerifiedBlob(s.blobPath(segmentSetID, segment), s.maxBlobBytes(), meta.BlobSHA256)
+	if err != nil {
+		return StreamEntry{}, false, false, fmt.Errorf("read cache segment: %w", err)
+	}
+	if !exists || !digestMatch {
+		return StreamEntry{}, false, true, nil
+	}
+	return StreamEntry{
+		Body:        &segmentStream{file: file, limited: io.LimitReader(file, size), store: s},
+		Size:        size,
+		ContentType: meta.ContentType,
+		ExpiresAt:   meta.ExpiresAt,
+	}, true, false, nil
+}
+
+func (s *Store) openExclusive(lock *sync.RWMutex, tenantDir, segmentSetID, segment string, now time.Time) (StreamEntry, bool, error) {
 	lock.Lock()
 	defer lock.Unlock()
 	rootLock, err := s.lockRoot()
 	if err != nil {
-		return Entry{}, false, err
+		return StreamEntry{}, false, err
 	}
 	defer unlockRoot(rootLock)
-	tenant, err := s.openTenantDir(tenantDir, true)
+
+	tenant, err := s.openTenantDir(tenantDir, false)
+	if errors.Is(err, syscall.ENOENT) || errors.Is(err, os.ErrNotExist) {
+		return StreamEntry{}, false, nil
+	}
 	if err != nil {
-		return Entry{}, false, err
+		return StreamEntry{}, false, err
 	}
 	defer tenant.close()
 	if err := s.reconcileTenant(tenantDir); err != nil {
-		return Entry{}, false, err
+		return StreamEntry{}, false, err
 	}
 	if err := tenant.verify(); err != nil {
-		return Entry{}, false, err
+		return StreamEntry{}, false, err
 	}
 	meta, err := s.readStoredMeta(s.metaPath(segmentSetID, segment))
 	if errors.Is(err, os.ErrNotExist) {
-		return Entry{}, false, nil
+		return StreamEntry{}, false, nil
 	}
 	if err != nil {
-		return Entry{}, false, err
+		return StreamEntry{}, false, err
 	}
-	if meta.Segment != segment || meta.BlobSHA256 == "" {
+	if meta.Segment != segment || meta.BlobSHA256 == "" || !meta.ExpiresAt.After(now) {
 		if err := s.deleteLocked(segmentSetID, segment); err != nil {
-			return Entry{}, false, err
+			return StreamEntry{}, false, err
 		}
-		return Entry{}, false, nil
+		return StreamEntry{}, false, nil
 	}
-	now := time.Now
-	if s.now != nil {
-		now = s.now
-	}
-	if !meta.ExpiresAt.After(now()) {
-		if err := s.deleteLocked(segmentSetID, segment); err != nil {
-			return Entry{}, false, err
-		}
-		return Entry{}, false, nil
-	}
-	blob, err := s.readNode(s.blobPath(segmentSetID, segment), s.TenantCapBytes)
+	file, size, exists, digestMatch, err := s.openVerifiedBlob(s.blobPath(segmentSetID, segment), s.maxBlobBytes(), meta.BlobSHA256)
 	if err != nil {
-		return Entry{}, false, fmt.Errorf("read cache segment: %w", err)
+		return StreamEntry{}, false, fmt.Errorf("read cache segment: %w", err)
 	}
-	if !blob.exists {
+	if !exists || !digestMatch {
 		if err := s.deleteLocked(segmentSetID, segment); err != nil {
-			return Entry{}, false, err
+			return StreamEntry{}, false, err
 		}
-		return Entry{}, false, nil
+		return StreamEntry{}, false, nil
 	}
-	if blob.digest != meta.BlobSHA256 {
-		if err := s.deleteLocked(segmentSetID, segment); err != nil {
-			return Entry{}, false, err
-		}
-		return Entry{}, false, nil
-	}
-	return Entry{Bytes: blob.body, ContentType: meta.ContentType, ExpiresAt: meta.ExpiresAt}, true, nil
+	return StreamEntry{
+		Body:        &segmentStream{file: file, limited: io.LimitReader(file, size), store: s},
+		Size:        size,
+		ContentType: meta.ContentType,
+		ExpiresAt:   meta.ExpiresAt,
+	}, true, nil
 }
 
 func (s *Store) Put(segmentSetID, segment string, entry Entry) error {
+	return s.PutStream(segmentSetID, segment, entry.ContentType, entry.ExpiresAt, int64(len(entry.Bytes)), bytes.NewReader(entry.Bytes))
+}
+
+func (s *Store) PutStream(segmentSetID, segment, contentType string, expiresAt time.Time, size int64, body io.Reader) error {
 	if err := s.beginOperation(); err != nil {
 		return err
 	}
@@ -268,10 +415,10 @@ func (s *Store) Put(segmentSetID, segment string, entry Entry) error {
 	if s.now != nil {
 		now = s.now
 	}
-	if !entry.ExpiresAt.After(now()) {
+	if !expiresAt.After(now()) {
 		return errors.New("cache entry expiry must be in the future")
 	}
-	if int64(len(entry.Bytes)) > s.TenantCapBytes {
+	if size < 0 || size > s.maxBlobBytes() {
 		return ErrQuotaExceeded
 	}
 	tenantDir := s.tenantDir(segmentSetID)
@@ -301,17 +448,17 @@ func (s *Store) Put(segmentSetID, segment string, entry Entry) error {
 		return err
 	}
 	s.setUsed(tenantDir, current)
-	if entry.ContentType == "" {
-		entry.ContentType = "application/octet-stream"
+	if contentType == "" {
+		contentType = "application/octet-stream"
 	}
-	metaBody, err := json.Marshal(storedMeta{
-		Segment: segment, ContentType: entry.ContentType, ExpiresAt: entry.ExpiresAt,
-		BlobSHA256: fileDigest(entry.Bytes),
+	placeholderMeta, err := json.Marshal(storedMeta{
+		Segment: segment, ContentType: contentType, ExpiresAt: expiresAt,
+		BlobSHA256: strings.Repeat("0", 64),
 	})
 	if err != nil {
 		return fmt.Errorf("marshal cache metadata: %w", err)
 	}
-	if int64(len(metaBody)) > maxStructuredNodeBytes {
+	if int64(len(placeholderMeta)) > maxStructuredNodeBytes {
 		return errors.New("cache metadata exceeds size limit")
 	}
 	oldBlob, oldMeta, valid, err := s.inspectPublication(blobPath, metaPath, segment)
@@ -329,12 +476,26 @@ func (s *Store) Put(segmentSetID, segment string, entry Entry) error {
 		s.setUsed(tenantDir, current)
 		oldBlob, oldMeta = nodeState{}, nodeState{}
 	}
-	projected := current - oldBlob.size - oldMeta.size + int64(len(entry.Bytes)+len(metaBody))
+	projected := current - oldBlob.size - oldMeta.size + size + int64(len(placeholderMeta))
 	if projected > s.TenantCapBytes {
 		return ErrQuotaExceeded
 	}
-	txn, txnDir, err := s.stageTransaction(
-		tenantDir, filepath.Base(blobPath), entry.Bytes, metaBody, oldBlob.digest, oldMeta.digest,
+	txn, txnDir, err := s.stageTransactionStream(
+		tenantDir, filepath.Base(blobPath), size, body,
+		func(blobSHA256 string) ([]byte, error) {
+			metaBody, marshalErr := json.Marshal(storedMeta{
+				Segment: segment, ContentType: contentType, ExpiresAt: expiresAt,
+				BlobSHA256: blobSHA256,
+			})
+			if marshalErr != nil {
+				return nil, fmt.Errorf("marshal cache metadata: %w", marshalErr)
+			}
+			if int64(len(metaBody)) > maxStructuredNodeBytes {
+				return nil, errors.New("cache metadata exceeds size limit")
+			}
+			return metaBody, nil
+		},
+		oldBlob.digest, oldMeta.digest,
 	)
 	if err != nil {
 		s.invalidateUsed(tenantDir)
@@ -533,7 +694,7 @@ func (s *Store) reapTenantDir(tenantDir string, now time.Time) {
 		if blobInfo.Mode&unix.S_IFMT != unix.S_IFREG {
 			continue
 		}
-		blobNode, err := s.readNode(blobPath, s.TenantCapBytes)
+		blobNode, err := s.statAndHashNode(blobPath, s.TenantCapBytes)
 		if err != nil || blobNode.digest != meta.BlobSHA256 {
 			continue
 		}
@@ -611,7 +772,7 @@ func (s *Store) Inventory(segmentSetID string) (Inventory, error) {
 			continue
 		}
 		blobPath := s.blobPath(segmentSetID, meta.Segment)
-		blob, err := s.readNode(blobPath, s.TenantCapBytes)
+		blob, err := s.statAndHashNode(blobPath, s.TenantCapBytes)
 		if err != nil {
 			return Inventory{}, fmt.Errorf("inventory cache tenant dir: %w", err)
 		}
@@ -689,7 +850,7 @@ func (s *Store) deleteLocked(segmentSetID, segment string) error {
 }
 
 func (s *Store) inspectPublication(blobPath, metaPath, segment string) (nodeState, nodeState, bool, error) {
-	blob, err := s.readNode(blobPath, s.TenantCapBytes)
+	blob, err := s.statAndHashNode(blobPath, s.TenantCapBytes)
 	if err != nil {
 		return nodeState{}, nodeState{}, false, err
 	}
@@ -719,7 +880,7 @@ func (s *Store) removePairPaths(blobPath, metaPath string) (int64, error) {
 	if err := validateDirectory(parent); err != nil {
 		return 0, err
 	}
-	blob, err := s.readNode(blobPath, s.TenantCapBytes)
+	blob, err := s.statAndHashNode(blobPath, s.TenantCapBytes)
 	if err != nil {
 		return 0, err
 	}

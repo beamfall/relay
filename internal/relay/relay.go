@@ -184,6 +184,10 @@ type Config struct {
 	// at least this plus StreamMemoryHeadroomBytes. <=0 uses
 	// DefaultStreamMemoryBudgetBytes.
 	StreamMemoryBudgetBytes int64
+	// CacheCarrierEnabled opts in to accepting carriers registering
+	// protocol.SurfaceCache. Disabled by default so relayd refuses the
+	// unshipped Media Cache carrier surface until it is wired and served.
+	CacheCarrierEnabled bool
 }
 
 type Server struct {
@@ -229,6 +233,7 @@ type Server struct {
 	closeOnce              sync.Once
 	wg                     sync.WaitGroup
 	yamuxStreamWindowBytes int
+	cacheCarrierEnabled    bool
 	tracer                 trace.Tracer // metadata-only mint→relay span (ADR-0146 §7); no-op unless operator opts in
 	publicRejectLog        *publicRejectSampler
 }
@@ -408,6 +413,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 		supersededMaxAge:       cfg.SupersededStreamMaxAge,
 		supersededPoll:         supersededSuccessorPoll,
 		yamuxStreamWindowBytes: cfg.YamuxStreamWindowBytes,
+		cacheCarrierEnabled:    cfg.CacheCarrierEnabled,
 		publicRejectLog:        newPublicRejectSampler(publicRejectLogSampleInterval, time.Now),
 	}
 	s.metrics.carrierReadiness = readiness
@@ -1105,6 +1111,19 @@ func (s *Server) carrierHandshake(ctx context.Context, rw protocol.FrameReadWrit
 		return VerifiedCarrier{}, false
 	}
 	if surface == protocol.SurfaceCache {
+		if !s.cacheCarrierEnabled {
+			s.handshakeThrottle.recordFailure(remote)
+			setHandshakeOutcome(span, dialOutcomeInvalid)
+			s.metrics.recordDial(dialOutcomeInvalid)
+			s.metrics.handshakeFailures.Add(1)
+			if s.redactConnLogs {
+				s.logger.Warn("cache carrier surface refused", "reason", "disabled")
+			} else {
+				s.logger.Warn("cache carrier surface refused", "remote", remote, "reason", "disabled")
+			}
+			_ = protocol.WriteFrame(rw, protocol.Frame{Type: protocol.FrameError, Error: "invalid hello"})
+			return VerifiedCarrier{}, false
+		}
 		if err := cache.ValidateTokenKey(frame.Hello.CacheVerificationKey); err != nil {
 			s.handshakeThrottle.recordFailure(remote)
 			setHandshakeOutcome(span, dialOutcomeInvalid)
@@ -1223,6 +1242,11 @@ func setHandshakeOutcome(span trace.Span, outcome string) {
 // protocol.Session.
 func (s *Server) serveCarrierSession(ctx context.Context, rw protocol.FrameReadWriter, session protocol.Session, verified VerifiedCarrier) {
 	if verified.Surface == protocol.SurfaceCache {
+		if !s.cacheCarrierEnabled {
+			_ = s.writeAckFrame(rw, protocol.Frame{Type: protocol.FrameError, Error: "invalid hello"})
+			_ = session.Close()
+			return
+		}
 		s.serveCacheCarrierSession(ctx, rw, session, verified)
 		return
 	}
@@ -1315,7 +1339,8 @@ func (s *Server) serveCacheCarrierSession(ctx context.Context, rw protocol.Frame
 		_ = session.Close()
 	}()
 	if s.cacheKeys != nil {
-		s.cacheKeys.rotate(verified.ID, verified.CacheVerificationKey)
+		s.cacheKeys.acquire(verified.ID, verified.CacheVerificationKey)
+		defer s.cacheKeys.release(verified.ID)
 	}
 	if s.redactConnLogs {
 		s.logger.Info("cache carrier connected")
@@ -1325,42 +1350,94 @@ func (s *Server) serveCacheCarrierSession(ctx context.Context, rw protocol.Frame
 	s.awaitCarrierEnd(ctx, session, verified, nil)
 }
 
+const cacheKeyRetentionTTL = cache.MaxTokenTTL
+
+type cacheKeyEntry struct {
+	keys      *cache.VerificationKeys
+	active    int
+	expiresAt time.Time
+}
+
 type cacheKeyRegistry struct {
+	now   func() time.Time
 	mu    sync.Mutex
-	rings map[string]*cache.VerificationKeys
+	rings map[string]*cacheKeyEntry
 }
 
 func newCacheKeyRegistry() *cacheKeyRegistry {
-	return &cacheKeyRegistry{rings: make(map[string]*cache.VerificationKeys)}
+	return &cacheKeyRegistry{
+		now:   time.Now,
+		rings: make(map[string]*cacheKeyEntry),
+	}
 }
 
-func (r *cacheKeyRegistry) rotate(carrierID string, key []byte) {
+func (r *cacheKeyRegistry) currentTime() time.Time {
+	if r != nil && r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
+func (r *cacheKeyRegistry) pruneLocked(now time.Time) {
+	for id, entry := range r.rings {
+		if entry.active == 0 && !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt) {
+			delete(r.rings, id)
+		}
+	}
+}
+
+func (r *cacheKeyRegistry) acquire(carrierID string, key []byte) {
 	if r == nil || carrierID == "" {
 		return
 	}
+	now := r.currentTime()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if keys := r.rings[carrierID]; keys != nil {
-		current := keys.Snapshot()[0]
+	r.pruneLocked(now)
+	if entry := r.rings[carrierID]; entry != nil {
+		current := entry.keys.Snapshot()[0]
 		if !bytes.Equal(current, key) {
-			_ = keys.Rotate(key)
+			_ = entry.keys.Rotate(key)
 		}
+		entry.active++
+		entry.expiresAt = time.Time{}
 		return
 	}
 	keys, err := cache.NewVerificationKeys(key)
 	if err != nil {
 		return
 	}
-	r.rings[carrierID] = keys
+	r.rings[carrierID] = &cacheKeyEntry{keys: keys, active: 1}
+}
+
+func (r *cacheKeyRegistry) release(carrierID string) {
+	if r == nil || carrierID == "" {
+		return
+	}
+	now := r.currentTime()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if entry := r.rings[carrierID]; entry != nil && entry.active > 0 {
+		entry.active--
+		if entry.active == 0 {
+			entry.expiresAt = now.Add(cacheKeyRetentionTTL)
+		}
+	}
+	r.pruneLocked(now)
 }
 
 func (r *cacheKeyRegistry) keys(carrierID string) *cache.VerificationKeys {
 	if r == nil {
 		return nil
 	}
+	now := r.currentTime()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.rings[carrierID]
+	r.pruneLocked(now)
+	if entry := r.rings[carrierID]; entry != nil {
+		return entry.keys
+	}
+	return nil
 }
 
 type cacheCarrierRegistry struct {
@@ -1377,8 +1454,12 @@ func (r *cacheCarrierRegistry) register(carrierID string, session protocol.Sessi
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	prev := r.sessions[carrierID]
 	r.sessions[carrierID] = session
+	r.mu.Unlock()
+	if prev != nil && prev != session {
+		_ = prev.Close()
+	}
 }
 
 func (r *cacheCarrierRegistry) unregister(carrierID string, session protocol.Session) {

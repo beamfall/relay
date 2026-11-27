@@ -5,11 +5,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/beamfall/relay/internal/cache"
 	"github.com/beamfall/relay/internal/protocol"
 )
 
@@ -128,10 +130,149 @@ func testCacheVerificationKey() []byte {
 
 func surfaceHandshakeServer(verifier TokenVerifier) *Server {
 	return &Server{
+		verifier:            verifier,
+		handshakeThrottle:   newHandshakeThrottle(),
+		cacheCarrierEnabled: true,
+		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		tracer:              noop.NewTracerProvider().Tracer("test"),
+	}
+}
+
+func TestCarrierHandshakeRefusesCacheSurfaceWhenDisabled(t *testing.T) {
+	key := testCacheVerificationKey()
+	verifier := &recordingCacheVerifier{}
+	server := &Server{
 		verifier:          verifier,
 		handshakeThrottle: newHandshakeThrottle(),
 		logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
 		tracer:            noop.NewTracerProvider().Tracer("test"),
+	}
+	frame := rejectHandshake(t, server, &protocol.Hello{
+		Version:              protocol.Version,
+		Token:                []byte("right"),
+		Hostnames:            []string{"home.relay.test"},
+		Surface:              protocol.SurfaceCache,
+		CacheProtocolVersion: protocol.CacheProtocolVersion,
+		CacheVerificationKey: key,
+	})
+	if frame.Error != "invalid hello" {
+		t.Fatalf("error = %q, want invalid hello", frame.Error)
+	}
+	if len(verifier.key) != 0 {
+		t.Fatal("disabled cache surface reached token verifier")
+	}
+	if got := server.metrics.handshakeFailures.Load(); got != 1 {
+		t.Fatalf("handshakeFailures = %d, want 1", got)
+	}
+}
+
+type closeTrackingSession struct {
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newCloseTrackingSession() *closeTrackingSession {
+	return &closeTrackingSession{closed: make(chan struct{})}
+}
+
+func (s *closeTrackingSession) Close() error {
+	s.closeOnce.Do(func() { close(s.closed) })
+	return nil
+}
+
+func (s *closeTrackingSession) IsClosed() bool {
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *closeTrackingSession) CloseChan() <-chan struct{} { return s.closed }
+func (s *closeTrackingSession) Open() (net.Conn, error)    { return nil, io.EOF }
+func (s *closeTrackingSession) Accept() (net.Conn, error)  { return nil, io.EOF }
+
+func TestServeCarrierSessionRefusesCacheSurfaceWhenDisabled(t *testing.T) {
+	server := &Server{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	client, peer := net.Pipe()
+	defer client.Close() //nolint:errcheck // test pipe cleanup.
+	defer peer.Close()   //nolint:errcheck // test pipe cleanup.
+
+	session := newCloseTrackingSession()
+	done := make(chan struct{})
+	go func() {
+		server.serveCarrierSession(context.Background(), peer, session, VerifiedCarrier{
+			ID:      "carrier-1",
+			Surface: protocol.SurfaceCache,
+		})
+		close(done)
+	}()
+
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	frame, err := protocol.ReadFrame(client)
+	if err != nil {
+		t.Fatalf("read error frame: %v", err)
+	}
+	if frame.Type != protocol.FrameError || frame.Error != "invalid hello" {
+		t.Fatalf("frame = %#v, want invalid hello error", frame)
+	}
+	<-done
+	if !session.IsClosed() {
+		t.Fatal("disabled cache carrier session was not closed")
+	}
+}
+
+func TestCacheCarrierSupersedesPreviousSession(t *testing.T) {
+	reg := newCacheCarrierRegistry()
+	first := newCloseTrackingSession()
+	second := newCloseTrackingSession()
+
+	reg.register("carrier-1", first)
+	if first.IsClosed() {
+		t.Fatal("first cache carrier session closed on initial register")
+	}
+	reg.register("carrier-1", second)
+	if !first.IsClosed() {
+		t.Fatal("superseded cache carrier session was not closed")
+	}
+	if second.IsClosed() {
+		t.Fatal("replacement cache carrier session was closed")
+	}
+	if got := reg.get("carrier-1"); got != second {
+		t.Fatalf("registered session = %v, want replacement", got)
+	}
+}
+
+func TestCacheKeyRegistryPrunesExpiredEntries(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	reg := newCacheKeyRegistry()
+	reg.now = func() time.Time { return now }
+
+	key1 := testCacheVerificationKey()
+	key2 := append([]byte(nil), key1...)
+	key2[0] ^= 0xff
+
+	reg.acquire("carrier-1", key1)
+	if reg.keys("carrier-1") == nil {
+		t.Fatal("active carrier keys missing")
+	}
+	reg.release("carrier-1")
+
+	now = now.Add(cache.MaxTokenTTL / 2)
+	if reg.keys("carrier-1") == nil {
+		t.Fatal("cache keys pruned before retention TTL elapsed")
+	}
+
+	now = now.Add(cache.MaxTokenTTL)
+	reg.acquire("carrier-2", key2)
+	if reg.keys("carrier-1") != nil {
+		t.Fatal("expired inactive cache keys were not pruned")
+	}
+	if reg.keys("carrier-2") == nil {
+		t.Fatal("active carrier-2 keys missing")
 	}
 }
 

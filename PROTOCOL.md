@@ -73,9 +73,11 @@ negotiation. Carriers must match the relay's protocol version.
 
 The cache carrier is an additive extension on that same `version: 1` hello. `surface` is optional;
 absent means `"passthrough"` for backward compatibility. A cache carrier sends
-`"surface":"cache"` plus `cache_protocol_version`. The relay rejects unknown surfaces, cache fields
-on a passthrough hello, missing cache verification keys, and cache protocol-version skew with the
-same clean `"invalid hello"` error frame.
+`"surface":"cache"` plus `cache_protocol_version`. Unless the relay is explicitly configured with
+the cache carrier surface enabled, `relayd` refuses `"surface":"cache"` with `"invalid hello"`
+before token verification or carrier slot reservation. When enabled, the relay still rejects
+unknown surfaces, cache fields on a passthrough hello, missing cache verification keys, and cache
+protocol-version skew with the same clean `"invalid hello"` error frame.
 
 ## Carrier Handshake
 

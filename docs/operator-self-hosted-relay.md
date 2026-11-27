@@ -73,6 +73,7 @@ above, started as `relayd cache-serve`.
 | `--cache-token-key-file` | `RELAYD_CACHE_TOKEN_KEY_FILE` (value form: `RELAYD_CACHE_TOKEN_KEY`) | *(empty; required)* | CacheAccessToken HMAC verification key file |
 | `--cache-store-dir` | `RELAYD_CACHE_STORE_DIR` | `/var/lib/beamfall-relay/cache` | cache segment store directory |
 | `--cache-tenant-cap-bytes` | `RELAYD_CACHE_TENANT_CAP_BYTES` | `0` (min of 25 GiB or 10% free disk) | per-tenant cache hard cap in bytes |
+| `--cache-max-conns` | `RELAYD_CACHE_MAX_CONNS` | `1024` | max concurrent HTTPS connections on the cache-serve listener; `0` uses the default |
 
 ### `cache-supervise` subcommand
 

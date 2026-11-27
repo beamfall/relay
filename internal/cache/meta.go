@@ -21,6 +21,15 @@ type sharedUsageCache struct {
 	used map[string]int64
 }
 
+const cacheCopyBufSize = 32 * 1024
+
+var cacheCopyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, cacheCopyBufSize)
+		return &buf
+	},
+}
+
 type verifiedDirectory struct {
 	path string
 	file *os.File
@@ -32,12 +41,28 @@ type verifiedDirectory struct {
 // admission decision, so this optimization is never quota authority.
 var usageCaches sync.Map
 
-// lockRoot serializes every cache publication, read, sweep, and recovery for a
-// shared Root. flock is released by the kernel on process exit, so a crash
-// cannot strand the fence. The guarantee covers cooperating Store processes on
-// filesystems that implement advisory flock; external writers and filesystems
-// without reliable flock semantics are outside the cache contract.
+// lockRoot serializes every cache mutation, sweep, and recovery for a shared
+// Root via an exclusive flock (LOCK_EX).
+//
+// CORE-2255 lock-mode check: lockRoot previously used LOCK_EX for Store.Get as
+// well, serializing cache reads across all homes. Clean reads now acquire
+// lockRootShared (LOCK_SH) so concurrent reads across homes run in parallel,
+// while still blocking behind any in-flight LOCK_EX publication and falling back
+// to LOCK_EX only when transaction recovery or eviction is needed.
+//
+// flock is released by the kernel on process exit, so a crash cannot strand
+// the fence. The guarantee covers cooperating Store processes on filesystems
+// that implement advisory flock; external writers and filesystems without
+// reliable flock semantics are outside the cache contract.
 func (s *Store) lockRoot() (*os.File, error) {
+	return s.lockRootWithMode(syscall.LOCK_EX)
+}
+
+func (s *Store) lockRootShared() (*os.File, error) {
+	return s.lockRootWithMode(syscall.LOCK_SH)
+}
+
+func (s *Store) lockRootWithMode(how int) (*os.File, error) {
 	path := filepath.Join(s.Root, ".cache.lock")
 	parent, name, err := s.openParent(path)
 	if err != nil {
@@ -61,7 +86,7 @@ func (s *Store) lockRoot() (*os.File, error) {
 		}
 		return nil, errors.New("cache root lock is not a private regular file")
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+	if err := syscall.Flock(int(file.Fd()), how); err != nil {
 		_ = file.Close()
 		return nil, fmt.Errorf("lock cache root: %w", err)
 	}
@@ -193,6 +218,42 @@ func (s *Store) readDirectory(path string) ([]os.DirEntry, error) {
 	return dir.ReadDir(-1)
 }
 
+var errShortPushBody = errors.New("short cache push body")
+
+func (s *Store) writeDurableStream(path string, size int64, body io.Reader) (string, error) {
+	parent, name, err := s.openParent(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = parent.Close() }()
+	fd, err := unix.Openat(
+		int(parent.Fd()), name,
+		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+		0o600,
+	)
+	if err != nil {
+		return "", err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	hasher := sha256.New()
+	bufPtr := cacheCopyBufPool.Get().(*[]byte)
+	written, err := io.CopyBuffer(io.MultiWriter(file, hasher), io.LimitReader(body, size), *bufPtr)
+	cacheCopyBufPool.Put(bufPtr)
+	if err == nil && written != size {
+		err = errShortPushBody
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
 func (s *Store) writeDurable(path string, body []byte) error {
 	parent, name, err := s.openParent(path)
 	if err != nil {
@@ -313,6 +374,142 @@ func (s *Store) readNode(path string, maxBytes int64) (nodeState, error) {
 		return nodeState{}, fmt.Errorf("cache node exceeds %d-byte limit: %s", maxBytes, path)
 	}
 	return nodeState{exists: true, size: info.Size(), digest: fileDigest(body), body: body}, nil
+}
+
+// statAndHashNode inspects a regular cache node and computes its SHA-256 digest
+// using a bounded copy buffer instead of loading the entire payload into RAM.
+func (s *Store) statAndHashNode(path string, maxBytes int64) (nodeState, error) {
+	parent, name, err := s.openParent(path)
+	if err != nil {
+		return nodeState{}, err
+	}
+	defer func() { _ = parent.Close() }()
+	var before unix.Stat_t
+	if err := unix.Fstatat(int(parent.Fd()), name, &before, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, syscall.ENOENT) {
+		return nodeState{}, nil
+	} else if err != nil {
+		return nodeState{}, fmt.Errorf("inspect cache node: %w", err)
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nodeState{}, fmt.Errorf("cache node is not regular: %s", path)
+	}
+	if before.Size > maxBytes {
+		return nodeState{}, fmt.Errorf("cache node exceeds %d-byte limit: %s", maxBytes, path)
+	}
+	fd, err := unix.Openat(
+		int(parent.Fd()), name,
+		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC,
+		0,
+	)
+	if errors.Is(err, syscall.ENOENT) {
+		return nodeState{}, nil
+	}
+	if err != nil {
+		return nodeState{}, fmt.Errorf("open cache node: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	info, statErr := file.Stat()
+	if statErr != nil || !info.Mode().IsRegular() || !sameFileStat(info, &before) ||
+		info.Size() > maxBytes {
+		_ = file.Close()
+		if statErr != nil {
+			return nodeState{}, statErr
+		}
+		return nodeState{}, fmt.Errorf("cache node changed during inspection: %s", path)
+	}
+	hasher := sha256.New()
+	bufPtr := cacheCopyBufPool.Get().(*[]byte)
+	n, readErr := io.CopyBuffer(hasher, io.LimitReader(file, maxBytes+1), *bufPtr)
+	cacheCopyBufPool.Put(bufPtr)
+	closeErr := file.Close()
+	if readErr != nil {
+		return nodeState{}, readErr
+	}
+	if closeErr != nil {
+		return nodeState{}, closeErr
+	}
+	if n > maxBytes {
+		return nodeState{}, fmt.Errorf("cache node exceeds %d-byte limit: %s", maxBytes, path)
+	}
+	return nodeState{exists: true, size: info.Size(), digest: hex.EncodeToString(hasher.Sum(nil))}, nil
+}
+
+// openVerifiedBlob opens a regular cache blob under maxBytes, verifies its
+// SHA-256 digest using a bounded copy buffer, and rewinds the descriptor to
+// offset 0 for streaming.
+func (s *Store) openVerifiedBlob(path string, maxBytes int64, expectedSHA256 string) (file *os.File, size int64, exists bool, digestMatch bool, err error) {
+	parent, name, err := s.openParent(path)
+	if err != nil {
+		return nil, 0, false, false, err
+	}
+	defer func() { _ = parent.Close() }()
+	var before unix.Stat_t
+	if err := unix.Fstatat(int(parent.Fd()), name, &before, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, syscall.ENOENT) {
+		return nil, 0, false, false, nil
+	} else if err != nil {
+		return nil, 0, false, false, fmt.Errorf("inspect cache node: %w", err)
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, 0, false, false, fmt.Errorf("cache node is not regular: %s", path)
+	}
+	if before.Size > maxBytes {
+		return nil, 0, true, false, fmt.Errorf("cache node exceeds %d-byte limit: %s", maxBytes, path)
+	}
+	fd, err := unix.Openat(
+		int(parent.Fd()), name,
+		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC,
+		0,
+	)
+	if errors.Is(err, syscall.ENOENT) {
+		return nil, 0, false, false, nil
+	}
+	if err != nil {
+		return nil, 0, false, false, fmt.Errorf("open cache node: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	info, statErr := f.Stat()
+	if statErr != nil || !info.Mode().IsRegular() || !sameFileStat(info, &before) ||
+		info.Size() > maxBytes {
+		_ = f.Close()
+		if statErr != nil {
+			return nil, 0, false, false, statErr
+		}
+		return nil, 0, false, false, fmt.Errorf("cache node changed during inspection: %s", path)
+	}
+	hasher := sha256.New()
+	bufPtr := cacheCopyBufPool.Get().(*[]byte)
+	n, readErr := io.CopyBuffer(hasher, io.LimitReader(f, maxBytes+1), *bufPtr)
+	cacheCopyBufPool.Put(bufPtr)
+	if readErr != nil {
+		_ = f.Close()
+		return nil, 0, true, false, readErr
+	}
+	if n > maxBytes {
+		_ = f.Close()
+		return nil, 0, true, false, fmt.Errorf("cache node exceeds %d-byte limit: %s", maxBytes, path)
+	}
+	if hex.EncodeToString(hasher.Sum(nil)) != expectedSHA256 {
+		_ = f.Close()
+		return nil, 0, true, false, nil
+	}
+	if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+		_ = f.Close()
+		return nil, 0, true, false, seekErr
+	}
+	return f, n, true, true, nil
+}
+
+func (s *Store) hasTransactionEntries(tenantDir string) (bool, error) {
+	entries, err := s.readDirectory(tenantDir)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), ".txn-") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *Store) nodeStat(path string) (unix.Stat_t, error) {
@@ -487,14 +684,14 @@ func rollbackOldPreserved(live, backup nodeState, oldDigest, newDigest string, c
 	return !createdByTxn && (matches(live, oldDigest) || matches(backup, oldDigest))
 }
 
-func (s *Store) tenantLock(tenantDir string) *sync.Mutex {
+func (s *Store) tenantLock(tenantDir string) *sync.RWMutex {
 	s.locksMu.Lock()
 	defer s.locksMu.Unlock()
 	if s.locks == nil {
-		s.locks = make(map[string]*sync.Mutex)
+		s.locks = make(map[string]*sync.RWMutex)
 	}
 	if s.locks[tenantDir] == nil {
-		s.locks[tenantDir] = &sync.Mutex{}
+		s.locks[tenantDir] = &sync.RWMutex{}
 	}
 	return s.locks[tenantDir]
 }

@@ -3,7 +3,9 @@ package cache
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -16,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -692,4 +695,147 @@ func getCacheSegmentResponse(t *testing.T, server *Server, token, segment string
 		t.Fatalf("read segment: %v", err)
 	}
 	return cacheResponse{status: resp.StatusCode, body: body}
+}
+
+func TestServerEnforcesConnectionCap(t *testing.T) {
+	now := testCacheNow()
+	store, err := NewStore(t.TempDir(), testKey, 1024)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if err := store.Put("segset_abc", "0001.m4s", Entry{Bytes: []byte("ok"), ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	cert := testCertificate(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server, err := Start(ctx, Config{
+		Addr:      "127.0.0.1:0",
+		AdminAddr: "127.0.0.1:0",
+		MaxConns:  2,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS13,
+		},
+		TokenVerifier: HMACTokenVerifier{
+			Key: testKey,
+			Now: func() time.Time { return now },
+		},
+		Store: store,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer server.Close() //nolint:errcheck // test cleanup.
+
+	tlsCfg := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13} //nolint:gosec // local test cert.
+	c1, err := tls.Dial("tcp", server.Addr(), tlsCfg)
+	if err != nil {
+		t.Fatalf("dial c1: %v", err)
+	}
+	defer c1.Close() //nolint:errcheck // test cleanup.
+	c2, err := tls.Dial("tcp", server.Addr(), tlsCfg)
+	if err != nil {
+		t.Fatalf("dial c2: %v", err)
+	}
+	defer c2.Close() //nolint:errcheck // test cleanup.
+
+	c3, err := tls.Dial("tcp", server.Addr(), tlsCfg)
+	if err == nil {
+		_ = c3.Close()
+		t.Fatal("third connection succeeded despite MaxConns=2")
+	}
+
+	metricsResp, err := http.Get("http://" + server.AdminAddr() + "/metrics")
+	if err != nil {
+		t.Fatalf("get metrics: %v", err)
+	}
+	metricsBody, _ := io.ReadAll(metricsResp.Body)
+	_ = metricsResp.Body.Close()
+	if !strings.Contains(string(metricsBody), "beamfall_cache_connections_over_cap_total 1") {
+		t.Fatalf("metrics missing over-cap counter:\n%s", string(metricsBody))
+	}
+
+	_ = c1.Close()
+	token, err := MintToken(testKey, "segset_abc", now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		client := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg, DisableKeepAlives: true}}
+		req, _ := http.NewRequest(http.MethodGet, "https://"+server.Addr()+"/cache/v1/segments/0001.m4s", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("new connection did not succeed after freeing a slot")
+}
+
+func TestServerStreamsSegmentWithoutFullBufferAllocation(t *testing.T) {
+	now := testCacheNow()
+	const segSize = 2 * 1024 * 1024
+	store, err := NewStore(t.TempDir(), testKey, 16*1024*1024)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	payload := bytes.Repeat([]byte("segment-stream-data-"), segSize/len("segment-stream-data-")+1)[:segSize]
+	wantSum := sha256.Sum256(payload)
+	if err := store.Put("segset_abc", "0001.m4s", Entry{
+		Bytes: payload, ContentType: "video/mp4", ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	server := startCacheServer(t, store, now, nil)
+	token, err := MintToken(testKey, "segset_abc", now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // local test cert.
+	}}
+	fetch := func() {
+		req, err := http.NewRequest(http.MethodGet, "https://"+server.Addr()+"/cache/v1/segments/0001.m4s", nil)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		defer resp.Body.Close() //nolint:errcheck // test cleanup.
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if gotLen := resp.Header.Get("Content-Length"); gotLen != strconv.Itoa(segSize) {
+			t.Fatalf("Content-Length = %q, want %d", gotLen, segSize)
+		}
+		h := sha256.New()
+		n, err := io.Copy(h, resp.Body)
+		if err != nil || n != segSize {
+			t.Fatalf("stream copy n=%d err=%v, want %d", n, err, segSize)
+		}
+		if hex.EncodeToString(h.Sum(nil)) != hex.EncodeToString(wantSum[:]) {
+			t.Fatal("streamed segment digest mismatch")
+		}
+	}
+
+	// Warm up pooled buffers and TLS session before measuring allocations.
+	fetch()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	fetch()
+	runtime.ReadMemStats(&after)
+	allocDelta := after.TotalAlloc - before.TotalAlloc
+	if allocDelta >= segSize {
+		t.Fatalf("GET allocated %d bytes for a %d-byte segment; expected streaming without full-segment buffering", allocDelta, segSize)
+	}
 }

@@ -218,16 +218,14 @@ func (h CarrierHandler) handlePush(ctx context.Context, rw io.ReadWriter, push *
 		_ = writeCacheAck(rw, PushAck{Status: "rejected", Error: "rate_limited"})
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(rw, push.Bytes))
-	if err != nil || int64(len(body)) != push.Bytes {
+	err := h.Store.PutStream(
+		push.SegmentSetID, push.Segment, push.ContentType, push.ExpiresAt,
+		push.Bytes, io.LimitReader(rw, push.Bytes),
+	)
+	if errors.Is(err, errShortPushBody) {
 		_ = writeCacheAck(rw, PushAck{Status: "rejected", Error: "invalid_push"})
 		return
 	}
-	err = h.Store.Put(push.SegmentSetID, push.Segment, Entry{
-		Bytes:       body,
-		ContentType: push.ContentType,
-		ExpiresAt:   push.ExpiresAt,
-	})
 	if errors.Is(err, ErrQuotaExceeded) {
 		_ = writeCacheAck(rw, h.ack(push.SegmentSetID, "rejected", ErrQuotaExceeded.Error()))
 		return

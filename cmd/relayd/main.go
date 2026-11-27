@@ -267,6 +267,10 @@ func runCacheServe(args []string) {
 	if err != nil {
 		log.Fatalf("load cache admin-allow-public default: %v", err)
 	}
+	maxConnsDefault, err := config.IntEnvOrDefault(os.Getenv("RELAYD_CACHE_MAX_CONNS"), cache.DefaultMaxConns)
+	if err != nil {
+		log.Fatalf("load cache max conns default: %v", err)
+	}
 	fs := flag.NewFlagSet("cache-serve", flag.ExitOnError)
 	addr := fs.String("cache-addr", config.EnvOrDefault(os.Getenv("RELAYD_CACHE_ADDR"), ":9444"), "HTTPS Media Cache segment listener address")
 	adminAddr := fs.String("cache-admin-addr", config.EnvOrDefault(os.Getenv("RELAYD_CACHE_ADMIN_ADDR"), "127.0.0.1:9081"), "cache health/metrics listener address")
@@ -277,6 +281,7 @@ func runCacheServe(args []string) {
 	tokenKeyFile := fs.String("cache-token-key-file", os.Getenv("RELAYD_CACHE_TOKEN_KEY_FILE"), "CacheAccessToken HMAC verification key file")
 	storeDir := fs.String("cache-store-dir", config.EnvOrDefault(os.Getenv("RELAYD_CACHE_STORE_DIR"), "/var/lib/beamfall-relay/cache"), "cache segment store directory")
 	tenantCapBytes := fs.Int64("cache-tenant-cap-bytes", tenantCapDefault, "per-tenant cache hard cap in bytes; 0 = min(25 GiB, 10% free disk)")
+	maxConns := fs.Int("cache-max-conns", maxConnsDefault, "max concurrent HTTPS connections on the cache-serve listener; 0 uses the default")
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("parse cache flags: %v", err)
 	}
@@ -309,6 +314,7 @@ func runCacheServe(args []string) {
 		},
 		TokenVerifier: cache.HMACTokenVerifier{Key: tokenKey},
 		Store:         store,
+		MaxConns:      *maxConns,
 		Logger:        slog.Default(),
 	})
 	if err != nil {

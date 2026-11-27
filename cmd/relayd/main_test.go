@@ -634,3 +634,10 @@ func TestQUICAddrDefaultsToCarrierAddr(t *testing.T) {
 		}
 	}
 }
+
+func TestRelaydConfigDisablesCacheCarrierByDefault(t *testing.T) {
+	cfg := buildRelayConfig(relaydFlags{})
+	if cfg.CacheCarrierEnabled {
+		t.Fatal("buildRelayConfig enabled CacheCarrierEnabled by default")
+	}
+}
