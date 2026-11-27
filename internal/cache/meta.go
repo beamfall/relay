@@ -220,6 +220,38 @@ func (s *Store) readDirectory(path string) ([]os.DirEntry, error) {
 
 var errShortPushBody = errors.New("short cache push body")
 
+func copyExactWithSHA256(dst io.Writer, src io.Reader, size int64) (string, error) {
+	hasher := sha256.New()
+	bufPtr := cacheCopyBufPool.Get().(*[]byte)
+	written, err := io.CopyBuffer(io.MultiWriter(dst, hasher), io.LimitReader(src, size), *bufPtr)
+	cacheCopyBufPool.Put(bufPtr)
+	if err != nil {
+		return "", err
+	}
+	if written != size {
+		return "", errShortPushBody
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func spoolPushBody(size int64, body io.Reader) (*os.File, string, error) {
+	file, err := os.CreateTemp("", "beamfall-cache-stage-*")
+	if err != nil {
+		return nil, "", fmt.Errorf("create cache spool file: %w", err)
+	}
+	digest, err := copyExactWithSHA256(file, body, size)
+	if err == nil {
+		_, err = file.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		name := file.Name()
+		_ = file.Close()
+		_ = os.Remove(name)
+		return nil, "", err
+	}
+	return file, digest, nil
+}
+
 func (s *Store) writeDurableStream(path string, size int64, body io.Reader) (string, error) {
 	parent, name, err := s.openParent(path)
 	if err != nil {
@@ -235,13 +267,7 @@ func (s *Store) writeDurableStream(path string, size int64, body io.Reader) (str
 		return "", err
 	}
 	file := os.NewFile(uintptr(fd), path)
-	hasher := sha256.New()
-	bufPtr := cacheCopyBufPool.Get().(*[]byte)
-	written, err := io.CopyBuffer(io.MultiWriter(file, hasher), io.LimitReader(body, size), *bufPtr)
-	cacheCopyBufPool.Put(bufPtr)
-	if err == nil && written != size {
-		err = errShortPushBody
-	}
+	digest, err := copyExactWithSHA256(file, body, size)
 	if err == nil {
 		err = file.Sync()
 	}
@@ -251,7 +277,7 @@ func (s *Store) writeDurableStream(path string, size int64, body io.Reader) (str
 	if err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(hasher.Sum(nil)), nil
+	return digest, nil
 }
 
 func (s *Store) writeDurable(path string, body []byte) error {

@@ -254,7 +254,9 @@ func TestCarrierPushTruncatedBodyRejectedCleanly(t *testing.T) {
 		frame.CacheAck.Status != "rejected" || frame.CacheAck.Error != "invalid_push" {
 		t.Fatalf("ack = %#v, want rejected/invalid_push", frame.CacheAck)
 	}
-	assertNoValidTransactions(t, store.tenantDir("segset"))
+	if _, statErr := os.Stat(store.tenantDir("segset")); !errors.Is(statErr, os.ErrNotExist) {
+		assertNoValidTransactions(t, store.tenantDir("segset"))
+	}
 }
 
 func TestCarrierPushQuotaAckRejectsWithoutEvicting(t *testing.T) {

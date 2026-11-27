@@ -1121,3 +1121,135 @@ func TestStoreConcurrentReadsAcrossTenantsDoNotSerialize(t *testing.T) {
 		t.Fatalf("home-a read = %#v", resA)
 	}
 }
+
+type blockingReader struct {
+	first   []byte
+	second  []byte
+	step    int
+	started chan struct{}
+	once    sync.Once
+	release chan struct{}
+}
+
+func (r *blockingReader) Read(p []byte) (int, error) {
+	switch r.step {
+	case 0:
+		r.step = 1
+		return copy(p, r.first), nil
+	case 1:
+		r.once.Do(func() { close(r.started) })
+		<-r.release
+		r.step = 2
+		return copy(p, r.second), nil
+	default:
+		return 0, io.EOF
+	}
+}
+
+func TestStorePutStreamStalledBodyDoesNotBlockOtherTenantReads(t *testing.T) {
+	store, err := NewStore(t.TempDir(), testKey, 64*1024)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	expires := time.Now().Add(time.Hour)
+	if err := store.Put("home-b", "0001.m4s", Entry{
+		Bytes: []byte("home-b-data"), ContentType: "video/mp4", ExpiresAt: expires,
+	}); err != nil {
+		t.Fatalf("put home-b: %v", err)
+	}
+
+	reader := &blockingReader{
+		first:   []byte("hello"),
+		second:  []byte("!"),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(reader.release) }) }
+	defer unblock()
+
+	putErr := make(chan error, 1)
+	go func() {
+		putErr <- store.PutStream("home-a", "0001.m4s", "video/mp4", expires, 6, reader)
+	}()
+
+	select {
+	case <-reader.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("PutStream did not start reading body")
+	}
+
+	readDone := make(chan error, 1)
+	go func() {
+		entry, ok, err := store.Get("home-b", "0001.m4s")
+		if err != nil {
+			readDone <- err
+			return
+		}
+		if !ok || string(entry.Bytes) != "home-b-data" {
+			readDone <- fmt.Errorf("unexpected home-b read: ok=%v body=%q", ok, entry.Bytes)
+			return
+		}
+		readDone <- nil
+	}()
+
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatalf("home-b read during stalled PutStream: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stalled PutStream blocked home-b read")
+	}
+
+	unblock()
+	if err := <-putErr; err != nil {
+		t.Fatalf("PutStream after unblock: %v", err)
+	}
+}
+
+func TestStoreStageTransactionWritesJournalBeforeBlobAndRecoversPartialBlob(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewStore(root, testKey, 64*1024)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	store.leaveFailedTransaction = true
+	store.failStep = func(name string) error {
+		if name == "before-sync-stage-blob" {
+			return errors.New("simulated crash during blob stage")
+		}
+		return nil
+	}
+
+	expires := time.Now().Add(time.Hour)
+	err = store.PutStream("segset", "0001.m4s", "video/mp4", expires, 11, strings.NewReader("staged-blob"))
+	if err == nil {
+		t.Fatal("expected simulated crash error")
+	}
+
+	// Verify transaction.json was written before new.bin was synced, and that
+	// even a truncated new.bin is cleaned up on restart.
+	matches, globErr := filepath.Glob(filepath.Join(root, "*", ".txn-*"))
+	if globErr != nil || len(matches) != 1 {
+		t.Fatalf("expected 1 staging dir, got %v (err=%v)", matches, globErr)
+	}
+	txnDir := matches[0]
+	if _, err := os.Stat(filepath.Join(txnDir, "transaction.json")); err != nil {
+		t.Fatalf("transaction.json missing before blob sync: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(txnDir, "new.bin"), []byte("part"), 0o600); err != nil {
+		t.Fatalf("truncate staged new.bin: %v", err)
+	}
+
+	restarted, err := NewStore(root, testKey, 64*1024)
+	if err != nil {
+		t.Fatalf("restart store: %v", err)
+	}
+	if _, err := os.Stat(txnDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned staging dir still present after restart: %v", err)
+	}
+	if _, ok, err := restarted.Get("segset", "0001.m4s"); err != nil || ok {
+		t.Fatalf("unexpected entry after aborted stage: ok=%v err=%v", ok, err)
+	}
+}

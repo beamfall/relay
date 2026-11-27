@@ -397,7 +397,17 @@ func (s *Store) openExclusive(lock *sync.RWMutex, tenantDir, segmentSetID, segme
 }
 
 func (s *Store) Put(segmentSetID, segment string, entry Entry) error {
-	return s.PutStream(segmentSetID, segment, entry.ContentType, entry.ExpiresAt, int64(len(entry.Bytes)), bytes.NewReader(entry.Bytes))
+	if err := s.beginOperation(); err != nil {
+		return err
+	}
+	defer s.endOperation()
+	contentType, expiresAt, metaBody, err := s.preparePut(segmentSetID, segment, entry.ContentType, entry.ExpiresAt, int64(len(entry.Bytes)), fileDigest(entry.Bytes))
+	if err != nil {
+		return err
+	}
+	_ = contentType
+	_ = expiresAt
+	return s.putPrepared(segmentSetID, segment, int64(len(entry.Bytes)), bytes.NewReader(entry.Bytes), fileDigest(entry.Bytes), metaBody)
 }
 
 func (s *Store) PutStream(segmentSetID, segment, contentType string, expiresAt time.Time, size int64, body io.Reader) error {
@@ -405,22 +415,61 @@ func (s *Store) PutStream(segmentSetID, segment, contentType string, expiresAt t
 		return err
 	}
 	defer s.endOperation()
-	if err := validateSegmentSetID(segmentSetID); err != nil {
+	if _, _, _, err := s.preparePut(segmentSetID, segment, contentType, expiresAt, size, strings.Repeat("0", 64)); err != nil {
 		return err
 	}
-	if err := validateSegmentName(segment); err != nil {
+	// Spool network-backed streams before acquiring any store lock so a
+	// stalled upload cannot hold root LOCK_EX or block other tenants' reads.
+	spoolFile, blobSHA, err := spoolPushBody(size, body)
+	if err != nil {
 		return err
+	}
+	defer func() {
+		name := spoolFile.Name()
+		_ = spoolFile.Close()
+		_ = os.Remove(name)
+	}()
+	_, _, metaBody, err := s.preparePut(segmentSetID, segment, contentType, expiresAt, size, blobSHA)
+	if err != nil {
+		return err
+	}
+	return s.putPrepared(segmentSetID, segment, size, spoolFile, blobSHA, metaBody)
+}
+
+func (s *Store) preparePut(segmentSetID, segment, contentType string, expiresAt time.Time, size int64, blobSHA string) (string, time.Time, []byte, error) {
+	if err := validateSegmentSetID(segmentSetID); err != nil {
+		return "", time.Time{}, nil, err
+	}
+	if err := validateSegmentName(segment); err != nil {
+		return "", time.Time{}, nil, err
 	}
 	now := time.Now
 	if s.now != nil {
 		now = s.now
 	}
 	if !expiresAt.After(now()) {
-		return errors.New("cache entry expiry must be in the future")
+		return "", time.Time{}, nil, errors.New("cache entry expiry must be in the future")
 	}
 	if size < 0 || size > s.maxBlobBytes() {
-		return ErrQuotaExceeded
+		return "", time.Time{}, nil, ErrQuotaExceeded
 	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	metaBody, err := json.Marshal(storedMeta{
+		Segment: segment, ContentType: contentType, ExpiresAt: expiresAt,
+		BlobSHA256: blobSHA,
+	})
+	if err != nil {
+		return "", time.Time{}, nil, fmt.Errorf("marshal cache metadata: %w", err)
+	}
+	if int64(len(metaBody)) > maxStructuredNodeBytes {
+		return "", time.Time{}, nil, errors.New("cache metadata exceeds size limit")
+	}
+	return contentType, expiresAt, metaBody, nil
+}
+
+func (s *Store) putPrepared(segmentSetID, segment string, size int64, body io.Reader, blobSHA string, metaBody []byte) error {
 	tenantDir := s.tenantDir(segmentSetID)
 	lock := s.tenantLock(tenantDir)
 	lock.Lock()
@@ -448,19 +497,6 @@ func (s *Store) PutStream(segmentSetID, segment, contentType string, expiresAt t
 		return err
 	}
 	s.setUsed(tenantDir, current)
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-	placeholderMeta, err := json.Marshal(storedMeta{
-		Segment: segment, ContentType: contentType, ExpiresAt: expiresAt,
-		BlobSHA256: strings.Repeat("0", 64),
-	})
-	if err != nil {
-		return fmt.Errorf("marshal cache metadata: %w", err)
-	}
-	if int64(len(placeholderMeta)) > maxStructuredNodeBytes {
-		return errors.New("cache metadata exceeds size limit")
-	}
 	oldBlob, oldMeta, valid, err := s.inspectPublication(blobPath, metaPath, segment)
 	if err != nil {
 		return fmt.Errorf("inspect existing cache publication: %w", err)
@@ -476,25 +512,12 @@ func (s *Store) PutStream(segmentSetID, segment, contentType string, expiresAt t
 		s.setUsed(tenantDir, current)
 		oldBlob, oldMeta = nodeState{}, nodeState{}
 	}
-	projected := current - oldBlob.size - oldMeta.size + size + int64(len(placeholderMeta))
+	projected := current - oldBlob.size - oldMeta.size + size + int64(len(metaBody))
 	if projected > s.TenantCapBytes {
 		return ErrQuotaExceeded
 	}
 	txn, txnDir, err := s.stageTransactionStream(
-		tenantDir, filepath.Base(blobPath), size, body,
-		func(blobSHA256 string) ([]byte, error) {
-			metaBody, marshalErr := json.Marshal(storedMeta{
-				Segment: segment, ContentType: contentType, ExpiresAt: expiresAt,
-				BlobSHA256: blobSHA256,
-			})
-			if marshalErr != nil {
-				return nil, fmt.Errorf("marshal cache metadata: %w", marshalErr)
-			}
-			if int64(len(metaBody)) > maxStructuredNodeBytes {
-				return nil, errors.New("cache metadata exceeds size limit")
-			}
-			return metaBody, nil
-		},
+		tenantDir, filepath.Base(blobPath), size, body, blobSHA, metaBody,
 		oldBlob.digest, oldMeta.digest,
 	)
 	if err != nil {

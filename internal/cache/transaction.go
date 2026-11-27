@@ -78,13 +78,12 @@ func transactionCommitted(err error) bool {
 
 func (s *Store) stageTransaction(tenantDir, blobName string, blob, meta []byte, oldBlobSHA, oldMetaSHA string) (cacheTxn, string, error) {
 	return s.stageTransactionStream(
-		tenantDir, blobName, int64(len(blob)), bytes.NewReader(blob),
-		func(string) ([]byte, error) { return meta, nil },
+		tenantDir, blobName, int64(len(blob)), bytes.NewReader(blob), fileDigest(blob), meta,
 		oldBlobSHA, oldMetaSHA,
 	)
 }
 
-func (s *Store) stageTransactionStream(tenantDir, blobName string, blobSize int64, blob io.Reader, buildMeta func(blobSHA256 string) ([]byte, error), oldBlobSHA, oldMetaSHA string) (cacheTxn, string, error) {
+func (s *Store) stageTransactionStream(tenantDir, blobName string, blobSize int64, blob io.Reader, blobSHA string, meta []byte, oldBlobSHA, oldMetaSHA string) (cacheTxn, string, error) {
 	if err := s.verifyTenantDir(tenantDir); err != nil {
 		return cacheTxn{}, "", err
 	}
@@ -96,6 +95,7 @@ func (s *Store) stageTransactionStream(tenantDir, blobName string, blobSize int6
 		Version: cacheTxnVersion, ID: hex.EncodeToString(nonce[:]),
 		TenantHash:  filepath.Base(tenantDir),
 		SegmentHash: strings.TrimSuffix(blobName, ".bin"), Phase: phaseStaging,
+		NewBlobSHA256: blobSHA, NewMetaSHA256: fileDigest(meta),
 		OldBlobSHA256: oldBlobSHA, OldMetaSHA256: oldMetaSHA,
 		BlobCreatedByTxn: oldBlobSHA == "", MetaCreatedByTxn: oldMetaSHA == "",
 	}
@@ -106,21 +106,14 @@ func (s *Store) stageTransactionStream(tenantDir, blobName string, blobSize int6
 	if err := s.syncMutation("create-transaction", tenantDir, txnDir); err != nil {
 		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, err)
 	}
-	blobSHA, err := s.writeDurableStream(filepath.Join(txnDir, "new.bin"), blobSize, blob)
-	if err != nil {
+	if err := s.writeJournal(tenantDir, txnDir, &txn, phaseStaging); err != nil {
+		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, err)
+	}
+	if _, err := s.writeDurableStream(filepath.Join(txnDir, "new.bin"), blobSize, blob); err != nil {
 		if errors.Is(err, errShortPushBody) {
 			return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, err)
 		}
 		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, fmt.Errorf("stage cache segment: %w", err))
-	}
-	meta, err := buildMeta(blobSHA)
-	if err != nil {
-		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, err)
-	}
-	txn.NewBlobSHA256 = blobSHA
-	txn.NewMetaSHA256 = fileDigest(meta)
-	if err := s.writeJournal(tenantDir, txnDir, &txn, phaseStaging); err != nil {
-		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, err)
 	}
 	if err := s.syncMutation("stage-blob", tenantDir, txnDir); err != nil {
 		return cacheTxn{}, "", s.abortStage(tenantDir, txnDir, err)
@@ -667,8 +660,17 @@ func (s *Store) recoverTransaction(tenantDir, txnDir string, txn cacheTxn) error
 		return err
 	}
 	if txn.Phase == phaseStaging {
-		if err := validateRecoverable(snapshot, txn); err != nil {
+		if err := validateCreationProvenance(txn); err != nil {
 			return err
+		}
+		if snapshot.oldBlob.exists || snapshot.oldMeta.exists {
+			return errors.New("cache transaction staging has unexpected backup")
+		}
+		if !matchesAbsentOr(snapshot.liveBlob, txn.OldBlobSHA256) || !matchesAbsentOr(snapshot.liveMeta, txn.OldMetaSHA256) {
+			if unrelatedLive(snapshot, txn) {
+				return s.removeTransaction(tenantDir, txnDir)
+			}
+			return errors.New("cache transaction staging live provenance mismatch")
 		}
 		return s.removeTransaction(tenantDir, txnDir)
 	}
